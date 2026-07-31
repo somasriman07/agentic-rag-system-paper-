@@ -45,5 +45,6 @@ llm_factory.py        embedding_factory.py
                   │
                   ▼
              Streamlit
+   -> Also added the stateless memory in the chat history .
    
     

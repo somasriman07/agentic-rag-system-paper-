@@ -7,7 +7,7 @@ warnings.filterwarnings("ignore", message="The default value of `allowed_objects
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import InjectedToolCallId, tool
 from Backend.llm_factory import get_llm
@@ -142,7 +142,10 @@ def web_search(
 # ── Retrieval agent singletons ────────────────────────────────────────────────
 
 RETRIEVAL_TOOLS = [retrieve_from_vectorstore, web_search]
-retrieval_llm = llm.bind_tools(RETRIEVAL_TOOLS, parallel_tool_calls=False)
+if type(llm).__name__ == "ChatOpenAI":
+    retrieval_llm = llm.bind_tools(RETRIEVAL_TOOLS, parallel_tool_calls=False)
+else:
+    retrieval_llm = llm.bind_tools(RETRIEVAL_TOOLS)
 base_tool_node = ToolNode(RETRIEVAL_TOOLS)
 
 RETRIEVE_SYSTEM = (
@@ -323,8 +326,13 @@ def generate_answer_node(state: RAGState) -> dict:
                 answer = "I don't know the answer."
             else:
                 context = "\n\n---\n\n".join(doc.page_content for doc in docs)
-                prompt = f"Answer the question using this context:\n\n{context}\n\nQuestion: {query}"
-                answer = llm.invoke([{"role": "user", "content": prompt}]).content
+                system_content = (
+                    "You are a helpful research assistant. Answer the user's question using the retrieved document context and the conversation history.\n\n"
+                    f"Retrieved Context:\n{context}"
+                )
+                system_message = SystemMessage(content=system_content)
+                messages = [system_message] + state["messages"]
+                answer = llm.invoke(messages).content
 
     elif route == "verify_claim":
         verdict = state.get("claim_verdict", "")
@@ -353,8 +361,9 @@ def generate_answer_node(state: RAGState) -> dict:
             )
 
     else:  # direct_answer
-        prompt = f"Answer from your knowledge.\n\nQuestion: {query}"
-        answer = llm.invoke([{"role": "user", "content": prompt}]).content
+        system_message = SystemMessage(content="You are a helpful research assistant. Answer the user's question using the conversation history and your knowledge.")
+        messages = [system_message] + state["messages"]
+        answer = llm.invoke(messages).content
 
     return {"answer": answer, "messages": [AIMessage(content=answer)]}
 
