@@ -11,4 +11,5 @@
                    -- add rag_graph.py
                    -- add vector_store.py
                    -- add __init__.py
-5. 
+5. Added about_project.md file (which i designed to have in the project)
+6. 
