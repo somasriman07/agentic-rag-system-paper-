@@ -12,4 +12,10 @@
                    -- add vector_store.py
                    -- add __init__.py
 5. Added about_project.md file (which i designed to have in the project)
-6. 
+6. Started building the backend files:
+    1. document loader 
+    2. vector_store along with added .env file :
+       QDRANT_URL=...
+       QDRANT_API_KEY=...
+       HUGGINGFACEHUB_API_TOKEN=...
+    
