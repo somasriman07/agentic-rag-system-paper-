@@ -20,5 +20,30 @@
        HUGGINGFACEHUB_API_TOKEN=...
     3. models.py file and btw_handler
        In btw_handler i used the  qwen2.5:3b from ollama as it is light weight task inorder to not under go rate limit.
-    4.
+      The project supports local inference for development and 
+      can be configured to use managed cloud models in production 
+      without changing the application logic.(Pluggable LLM Architecture)
+
+
+                      .env
+                   │
+                   ▼
+      ┌───────────────────────┐
+      │                       │
+      ▼                       ▼
+llm_factory.py        embedding_factory.py
+      │                       │
+      ▼                       ▼
+ graph.py              vector_store.py
+      │                       │
+      ▼                       ▼
+ btw_handler.py          CacheBackedEmbeddings
+      │                       │
+      └───────────┬───────────┘
+                  ▼
+             LangGraph
+                  │
+                  ▼
+             Streamlit
+   
     

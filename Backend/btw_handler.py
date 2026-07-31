@@ -6,15 +6,14 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 from tavily import TavilyClient
 
-from models import BtwRouteDecision
+from Backend.models import BtwRouteDecision
+from Backend.llm_factory import get_llm
 
 load_dotenv()
 
 
 
-llm = ChatOllama(
-    model="qwen2.5:3b"
-)
+llm = get_llm()
 
 
 def handle_btw(query: str) -> Generator[str, None, None]:

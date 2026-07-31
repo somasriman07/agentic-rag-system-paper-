@@ -4,24 +4,21 @@ from dotenv import load_dotenv
 from langchain_classic.embeddings import CacheBackedEmbeddings
 from langchain_classic.storage import LocalFileStore
 from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
+from Backend.embedding_factory import get_embedding_model
+from Backend.config import EMBEDDING_DIM
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 
 load_dotenv()
 
-# ── Config ───────────────────────────────────────────────────────────────────
 
-EMBEDDING_DIM = 384  
+
 
 # ── Singletons ────────────────────────────────────────────────────────────────
 
 
-
-base_embeddings = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-small-en-v1.5"
-)
+base_embeddings = get_embedding_model()
 embedding_file_store = LocalFileStore("./embedding_cache/")
 embeddings = CacheBackedEmbeddings.from_bytes_store(
     base_embeddings,
