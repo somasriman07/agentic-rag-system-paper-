@@ -15,7 +15,7 @@ def get_embedding_model():
         return HuggingFaceEmbeddings(
             model_name=os.getenv(
                 "HF_EMBEDDING_MODEL",
-                "BAAI/bge-small-en-v1.5"
+                "BAAI/bge-base-en-v1.5"
             )
         )
 

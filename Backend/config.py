@@ -1,5 +1,5 @@
 import os
 
 EMBEDDING_DIM = int(
-    os.getenv("EMBEDDING_DIM", "384")
+    os.getenv("EMBEDDING_DIM", "768")
 )
