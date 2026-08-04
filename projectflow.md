@@ -1,501 +1,167 @@
-╔══════════════════════════════════════════════════════════════════════════════════════════════╗
-║                                                                                        ║
-║         🚀 PRODUCTION-GRADE RESEARCH PAPER RAG ASSISTANT                               ║
-║                                                                                        ║
-║                  Project Development Journey | Engineering Workflow                    ║
-║                                                                                        ║
-╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+# 🛠️ Papeer — Project Build Log & Engineering Flow
 
-"Every production project starts with a simple idea.
- This file documents my complete engineering approach—from project setup
- to retrieval optimization and evaluation."
+> A behind-the-scenes look at how **Papeer** (a production-grade Research Paper RAG system) was designed, built, broken, debugged, and hardened — step by step.
 
-==============================================================================================
-PHASE 1 ─ PROJECT INITIALIZATION
-==============================================================================================
+This document exists for one reason: to show *how* I think, not just *what* I shipped. Anyone can list "Built a RAG app" on a resume. This log walks through the real decisions, the dead ends, the failures, and the fixes.
 
-📌 Created Git Repository
-    ├── Initialized local repository
-    ├── Connected GitHub remote
-    ├── Cloned project locally
-    └── Started version controlled development
+---
 
-📌 Environment Setup
+## 📍 Table of Contents
 
-    python3 -m venv venv
-    source venv/bin/activate
-    pip install -r requirements.txt
+1. [Phase 0 — Project Setup](#phase-0--project-setup)
+2. [Phase 1 — Backend Skeleton](#phase-1--backend-skeleton)
+3. [Phase 2 — Documenting Intent First](#phase-2--documenting-intent-first)
+4. [Phase 3 — Building the Core Backend](#phase-3--building-the-core-backend)
+5. [Phase 4 — The Pluggable LLM Architecture](#phase-4--the-pluggable-llm-architecture)
+6. [Phase 5 — The Retrieval Problem (and the Fix)](#phase-5--the-retrieval-problem-and-the-fix)
+7. [Phase 6 — Evaluation with RAGAS](#phase-6--evaluation-with-ragas)
+8. [Phase 7 — Hybrid Search (BM25 + MMR)](#phase-7--hybrid-search-bm25--mmr)
+9. [What's Next](#-whats-next)
 
-📌 Added essential project files
+---
 
-    ✓ .gitignore
-    ✓ README.md
-    ✓ requirements.txt
-    ✓ LICENSE
-    ✓ about_project.md      ← Custom designed project documentation
+## Phase 0 — Project Setup
 
+Before writing a single line of application code, the project was set up the way any production repo should be — reproducible, versioned, and clean from commit #1.
 
-==============================================================================================
-PHASE 2 ─ PROJECT STRUCTURE
-==============================================================================================
+```bash
+# 1. Initialize and clone the repo
+git init papeer
+git clone <repo-url>
+cd papeer
 
+# 2. Create an isolated virtual environment (macOS)
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Keep the repo clean
+touch .gitignore   # venv/, __pycache__/, .env, *.pyc, .DS_Store, local vector stores, etc.
+```
+
+**Why this matters:** starting with `venv` isolation and a `.gitignore` from day one avoids the classic "it works on my machine" trap and keeps secrets (API keys) out of version control — a small habit that signals engineering discipline early.
+
+---
+
+## Phase 1 — Backend Skeleton
+
+Rather than writing code inside a single monolithic script, the backend was scaffolded first so every future module had an obvious home:
+
+```
 backend/
-│
 ├── __init__.py
-├── paper_loader.py
-├── vector_store.py
-├── models.py
-├── llm_factory.py
-├── embedding_factory.py
-├── rag_graph.py
-├── btw_handler.py
-└── ...
+├── models.py          # Pydantic schemas / data models
+├── paper_loader.py     # Document ingestion & chunking
+├── vector_store.py     # Embeddings + Qdrant vector DB logic
+├── rag_graph.py         # LangGraph orchestration (the "brain")
+└── btw_handler.py       # LLM handler ("behind-the-wire" model logic)
+```
 
-Goal:
-Keep every component modular so individual pieces can be swapped without
-changing the rest of the system.
+**Why this matters:** designing the module boundaries *before* the implementation forces you to think about separation of concerns — ingestion, storage, orchestration, and inference are all independent, swappable pieces. This is what makes the system "pluggable" later.
 
+---
 
-==============================================================================================
-PHASE 3 ─ DOCUMENT INGESTION PIPELINE
-==============================================================================================
+## Phase 2 — Documenting Intent First
 
-Research Paper
-      │
-      ▼
-paper_loader.py
-      │
-      ▼
-Document Cleaning
-      │
-      ▼
-Chunking Strategy
-      │
-      ▼
-Embedding Generation
-      │
-      ▼
-Qdrant Vector Database
-      │
-      ▼
-Ready for Retrieval
+Before writing the retrieval or generation logic, an `about_project.md` was written to capture the *intended* design: goals, scope, and constraints. Writing the spec before the implementation kept the build focused and gave a reference point to check the system against once it was live.
 
-Implemented:
+---
 
-✓ PDF Loading
-✓ Text preprocessing
-✓ Intelligent chunking
-✓ Metadata preservation
-✓ Vector indexing
+## Phase 3 — Building the Core Backend
 
+Backend development moved in a deliberate order — data in, data stored, then data reasoned over:
 
-==============================================================================================
-PHASE 4 ─ VECTOR DATABASE SETUP
-==============================================================================================
+1. **`paper_loader.py`** — document loader responsible for ingesting research papers and preparing them for chunking/embedding.
+2. **`vector_store.py`** — wired up to **Qdrant** for vector storage, alongside a `.env` file for secrets:
+   ```env
+   QDRANT_URL=...
+   QDRANT_API_KEY=...
+   HUGGINGFACEHUB_API_TOKEN=...
+   ```
+3. **`models.py`** and **`btw_handler.py`** — the LLM handling layer. For local development, **`qwen2.5:3b` via Ollama** was chosen deliberately: it's lightweight enough to run locally without hitting API rate limits, while still being capable enough to validate the pipeline end-to-end before spending API credits.
 
-Configured secure environment variables
+---
 
-.env
+## Phase 4 — The Pluggable LLM Architecture
 
-QDRANT_URL=...
-QDRANT_API_KEY=...
-HUGGINGFACEHUB_API_TOKEN=...
+A key design decision: **the application logic should never care which model is answering the question.** Whether it's a local Ollama model during development or a managed cloud model in production, the graph, the retriever, and the UI stay untouched. Only the factory layer changes.
 
-Responsibilities
-
-vector_store.py
-
-• Create collection
-• Generate embeddings
-• Store vectors
-• Similarity search
-• Metadata storage
-
-
-==============================================================================================
-PHASE 5 ─ PLUGGABLE MODEL ARCHITECTURE
-==============================================================================================
-
-One of the main engineering goals was to avoid hardcoding any LLM.
-
-Instead, I designed a factory-based architecture.
-
-                             .env
-                               │
-                               ▼
-         ┌─────────────────────────────┐
-         │                             │
-         ▼                             ▼
- llm_factory.py               embedding_factory.py
-         │                             │
-         ▼                             ▼
-     graph.py                  vector_store.py
-         │                             │
-         ▼                             ▼
-   btw_handler.py           CacheBackedEmbeddings
-         │                             │
-         └──────────────┬──────────────┘
-                        ▼
-                    LangGraph
+```
+                       .env
                         │
                         ▼
-                   Streamlit UI
+        ┌───────────────────────────┐
+        │                           │
+        ▼                           ▼
+ llm_factory.py           embedding_factory.py
+        │                           │
+        ▼                           ▼
+   rag_graph.py               vector_store.py
+        │                           │
+        ▼                           ▼
+ btw_handler.py           CacheBackedEmbeddings
+        │                           │
+        └─────────────┬─────────────┘
+                       ▼
+                   LangGraph
+                       │
+                       ▼
+                   Streamlit
+```
 
+On top of this, **stateless conversational memory** was added to the chat history — each session tracks its own context without leaking state across users, keeping the graph horizontally scalable.
 
-Benefits
+**Why this matters:** this is the difference between a notebook demo and a system designed for production. Swapping `qwen2.5:3b` for a hosted model later required zero changes to `rag_graph.py` — only the factory config.
 
-✓ Easily switch models
-✓ Production ready
-✓ Cleaner architecture
-✓ No application code changes required
+---
 
+## Phase 5 — The Retrieval Problem (and the Fix)
 
-==============================================================================================
-PHASE 6 ─ LOCAL-FIRST DEVELOPMENT
-==============================================================================================
+At inference time, the first real bug surfaced: the retriever wasn't hallucinating — which would've been the *easier* problem — it was doing something worse. It was correctly identifying when it didn't know, and responding **"I don't have the answer"** far too often, even when the answer clearly existed in the source paper.
 
-Development LLM
+**Root cause:** naive chunking meant that individual retrieved chunks lacked enough surrounding context for the LLM to confidently ground its answer, so the model played it safe and refused to answer.
 
-Ollama
-└── qwen2.5:3b
+**The fix — Parent Document Retrieval:**
+- Small "child" chunks are embedded and indexed in Qdrant for precise semantic search.
+- Their full "parent" documents are persisted separately (initially in a local file store), and once a child chunk matches, the **full parent context** is handed to the LLM instead of the narrow fragment.
 
-Reason
+The result: retrieval accuracy jumped immediately, and the model started answering correctly and confidently instead of defaulting to "I don't know." This was the single biggest quality unlock in the whole project.
 
-✓ Lightweight
-✓ Fast local inference
-✓ No API rate limits
-✓ Offline development
-✓ Lower development cost
+---
 
-Production Ready
+## Phase 6 — Evaluation with RAGAS
 
-The same architecture can switch to
+Gut-feeling ("it seems to work now") isn't good enough for a production-grade system, so the pipeline was evaluated quantitatively using **RAGAS**, across 5 core metrics (faithfulness, answer relevancy, context precision, context recall, and context relevancy).
 
-• Gemini
-• OpenAI
-• Claude
-• Azure OpenAI
+One practical constraint: **Ollama doesn't support parallel test execution**, which makes batch evaluation painfully slow. So evaluation was decoupled from generation — the local Ollama model stayed in place for actual RAG answers, while the **Gemini model was used purely as the RAGAS judge**, enabling parallelized, faster evaluation runs.
 
-without modifying business logic.
+Initial results landed around **~80% Answer Relevancy** — a strong baseline that highlighted exactly where the pipeline still had room to improve (precision on ambiguous, multi-paper queries).
 
+---
 
-==============================================================================================
-PHASE 7 ─ RAG PIPELINE
-==============================================================================================
+## Phase 7 — Hybrid Search (BM25 + MMR)
 
-                 User Query
-                      │
-                      ▼
-               Query Processing
-                      │
-                      ▼
-          Embedding Generation
-                      │
-                      ▼
-            Vector Similarity Search
-                      │
-                      ▼
-        Retrieved Context Documents
-                      │
-                      ▼
-              Prompt Construction
-                      │
-                      ▼
-                  Selected LLM
-                      │
-                      ▼
-               Final Response
+With a solid relevancy baseline established, retrieval was upgraded from pure dense vector search to a **hybrid approach**:
 
+- **BM25** — classic sparse keyword search, which excels at exact term/entity matching (crucial for research papers full of specific terminology, author names, and technical jargon that dense embeddings can blur).
+- **MMR (Maximal Marginal Relevance)** — re-ranks results to reduce redundancy and surface *diverse* supporting passages instead of five near-duplicate chunks, which matters a lot for research paper Q&A where an answer often needs synthesis across sections.
 
-==============================================================================================
-PHASE 8 ─ LANGGRAPH ORCHESTRATION
-==============================================================================================
+Combining sparse (BM25) and dense (embedding) retrieval gave the system the best of both: precision on exact terms, and semantic understanding on conceptual questions.
 
-Instead of creating a simple sequential pipeline,
+---
 
-I orchestrated the workflow using LangGraph.
+## 🔭 What's Next
 
-Advantages
+A few natural next steps that weren't fully captured above but are worth calling out as the project matures:
 
-✓ Modular execution
-✓ Easy debugging
-✓ Future agent integration
-✓ Production scalability
-✓ Cleaner state management
+- [ ] **Testing** — unit tests for `paper_loader.py` chunking logic and integration tests for the LangGraph pipeline.
+- [ ] **`.env.example`** — a template committed to the repo so new contributors know exactly which secrets to set up.
+- [ ] **Dockerfile** — containerize the backend + Streamlit app for one-command reproducibility.
+- [ ] **CI pipeline** — lint + test on every push (GitHub Actions).
+- [ ] **Cross-encoder reranking** — layering a reranker on top of the hybrid retriever for a further precision boost.
+- [ ] **Persistent parent store migration** — moving the parent docstore from local file storage to a managed Postgres instance for durability across deployments.
+- [ ] **Deployment** — Streamlit Cloud / Docker deployment with a public demo link.
+- [ ] **Security hardening** — rate limiting, PII detection, and audit logging on the inference endpoints.
 
+---
 
-==============================================================================================
-PHASE 9 ─ CHAT MEMORY
-==============================================================================================
-
-Implemented
-
-✓ Stateless Conversation Memory
-
-Purpose
-
-• Preserve previous interactions
-• Better follow-up questions
-• More natural conversations
-
-
-==============================================================================================
-PHASE 10 ─ RETRIEVAL TESTING
-==============================================================================================
-
-Initial Testing
-
-Question
-↓
-
-Retriever
-
-↓
-
-❌ Wrong Context Retrieved
-
-↓
-
-LLM
-
-↓
-
-"I don't have enough information."
-
-Observation
-
-The LLM wasn't hallucinating.
-
-Instead,
-
-the retriever failed to retrieve the correct context.
-
-Conclusion
-
-The bottleneck was Retrieval,
-NOT Generation.
-
-
-==============================================================================================
-PHASE 11 ─ RETRIEVAL OPTIMIZATION
-==============================================================================================
-
-Problem
-
-Small chunks lost important surrounding context.
-
-Solution
-
-Implemented
-
-Parent Document Retriever
-
-Architecture
-
-Question
-    │
-    ▼
-Child Chunk Search
-    │
-    ▼
-Retrieve Parent Document
-    │
-    ▼
-Complete Context
-    │
-    ▼
-LLM
-
-Parent documents stored using Local File Store.
-
-Result
-
-✅ Better contextual retrieval
-
-✅ Higher answer accuracy
-
-✅ Significantly improved grounding
-
-✅ Reduced retrieval failures
-
-(Uff... finally the retriever started bringing the correct documents 😄)
-
-
-==============================================================================================
-PHASE 12 ─ EMBEDDING OPTIMIZATION
-==============================================================================================
-
-Implemented
-
-✓ CacheBackedEmbeddings
-
-Benefits
-
-• Faster indexing
-• Avoid repeated embedding generation
-• Reduced API usage
-• Improved development speed
-
-
-==============================================================================================
-PHASE 13 ─ EVALUATION
-==============================================================================================
-
-After the retrieval pipeline became stable,
-
-I moved to systematic evaluation using RAGAS.
-
-Metrics
-
-✓ Faithfulness
-
-✓ Answer Relevancy
-
-✓ Context Precision
-
-✓ Context Recall
-
-✓ Response Relevancy
-
-Observation
-
-For evaluation,
-
-I replaced the local Ollama model with Gemini because:
-
-• Gemini supports faster API execution
-• Better parallel evaluation
-• More stable scoring
-• Faster experimentation
-
-The production pipeline remains model agnostic.
-
-
-==============================================================================================
-PHASE 14 ─ SOFTWARE ENGINEERING PRACTICES
-==============================================================================================
-
-Throughout development I followed
-
-✓ Modular architecture
-
-✓ Separation of concerns
-
-✓ Environment variable management
-
-✓ Factory Design Pattern
-
-✓ Reusable components
-
-✓ Configuration-driven design
-
-✓ Git version control
-
-✓ Incremental testing
-
-✓ Retrieval-first debugging
-
-✓ Evaluation-driven improvements
-
-
-==============================================================================================
-CURRENT ARCHITECTURE
-==============================================================================================
-
-                     Research Paper
-                           │
-                           ▼
-                    Document Loader
-                           │
-                           ▼
-                    Text Chunking
-                           │
-                           ▼
-                  Embedding Factory
-                           │
-                           ▼
-                CacheBackedEmbeddings
-                           │
-                           ▼
-                  Qdrant Vector Store
-                           │
-                           ▼
-               Parent Document Retriever
-                           │
-                           ▼
-                     LangGraph Engine
-                           │
-                           ▼
-                    Prompt Generation
-                           │
-                           ▼
-                     LLM Factory
-                           │
-                           ▼
-                  qwen2.5 / Gemini
-                           │
-                           ▼
-                     Streamlit UI
-
-
-==============================================================================================
-WHAT THIS PROJECT TAUGHT ME
-==============================================================================================
-
-✔ Retrieval quality matters more than choosing a larger LLM.
-
-✔ A modular architecture makes production migration effortless.
-
-✔ Debugging RAG requires validating every stage independently:
-   Loader → Chunking → Embeddings → Retrieval → Prompt → LLM.
-
-✔ Evaluation should be data-driven, not intuition-driven.
-
-✔ Building production AI systems is as much about software engineering
-  as it is about machine learning.
-
-
-==============================================================================================
-NEXT IMPROVEMENTS
-==============================================================================================
-
-□ Hybrid Search (BM25 + Dense Retrieval)
-
-□ Query Rewriting / HyDE
-
-□ Cross Encoder Re-ranking
-
-□ Multi-query Retrieval
-
-□ Metadata Filtering
-
-□ Streaming Responses
-
-□ Conversation Summarization Memory
-
-□ Observability (LangSmith / Phoenix)
-
-□ Docker + CI/CD Deployment
-
-□ Unit & Integration Tests
-
-□ API Deployment (FastAPI)
-
-□ Authentication & Rate Limiting
-
-
-==============================================================================================
-FINAL NOTE
-==============================================================================================
-
-This project was not built by simply connecting an LLM to a vector database.
-
-It was developed iteratively—testing, identifying bottlenecks, optimizing
-retrieval, evaluating with RAGAS, and designing a modular architecture that
-can transition from local development to production with minimal code changes.
-
-That engineering journey is what transformed this from a demo into a
-production-oriented Retrieval-Augmented Generation (RAG) system.
-
-                                           — Built with curiosity, debugging,
-                                             and a lot of coffee ☕

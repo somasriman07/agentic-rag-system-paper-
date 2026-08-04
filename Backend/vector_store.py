@@ -4,7 +4,8 @@ from dotenv import load_dotenv
 from langchain_classic.embeddings import CacheBackedEmbeddings
 from langchain_classic.storage import LocalFileStore
 from langchain_classic.storage._lc_store import create_kv_docstore
-from langchain_classic.retrievers import ParentDocumentRetriever
+from langchain_classic.retrievers import ParentDocumentRetriever, EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from Backend.embedding_factory import get_embedding_model
@@ -151,6 +152,54 @@ def list_papers(session_id: str) -> list[str]:
 
 
 def search(query: str, session_id: str, k: int = 4) -> list[Document]:
-    retriever = get_parent_document_retriever(session_id)
-    retriever.search_kwargs = {"k": k}
-    return retriever.invoke(query)
+    docstore = get_docstore(session_id)
+    vectorstore = get_vectorstore(session_id)
+    
+    # Retrieve all parent documents currently loaded for this session
+    keys = list(docstore.yield_keys())
+    parent_docs = []
+    for k_val in keys:
+        doc = docstore.mget([k_val])[0]
+        if doc is not None:
+            # Inject the docstore key (doc_id) into parent metadata
+            # so child chunks split from it inherit this reference
+            doc.metadata["doc_id"] = k_val
+            parent_docs.append(doc)
+            
+    if not parent_docs:
+        return []
+        
+    # Split parent documents into child chunks to build local BM25 index
+    child_docs = child_splitter.split_documents(parent_docs)
+    
+    # Setup lexical retriever
+    bm25_retriever = BM25Retriever.from_documents(child_docs)
+    bm25_retriever.k = k
+    
+    # Setup semantic vector retriever with MMR for diverse responses
+    qdrant_retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": k, "fetch_k": 2 * k}
+    )
+    
+    # Combine via Reciprocal Rank Fusion (RRF)
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[bm25_retriever, qdrant_retriever],
+        weights=[0.5, 0.5]
+    )
+    
+    # Retrieve blended child chunks
+    child_results = ensemble_retriever.invoke(query)
+    
+    # Map retrieved child chunks back to their parent documents
+    seen_parent_ids = set()
+    retrieved_parents = []
+    for child in child_results:
+        parent_id = child.metadata.get("doc_id")
+        if parent_id and parent_id not in seen_parent_ids:
+            seen_parent_ids.add(parent_id)
+            parent_doc = docstore.mget([parent_id])[0]
+            if parent_doc is not None:
+                retrieved_parents.append(parent_doc)
+                
+    return retrieved_parents

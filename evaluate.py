@@ -96,26 +96,22 @@ def run_evaluation():
 
     # 4. Initialize Ragas models
     print("\nInitializing Ragas evaluation models...")
-    from langchain_google_genai import ChatGoogleGenerativeAI
     
-    # Use Gemini 2.5 Flash as the evaluator LLM for fast and reliable calculations
-    judge_llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        api_key=os.environ.get("GEMINI_API_KEY"),
-        temperature=0
-    )
+    # Use local Ollama model for evaluation
+    judge_llm = get_llm()
     from langchain_huggingface import HuggingFaceEmbeddings
-    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
+    embeddings = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-base-en-v1.5",
+        model_kwargs={"device": "cpu"}
+    )
     
     ragas_llm = LangchainLLMWrapper(judge_llm)
     ragas_embeddings = LangchainEmbeddingsWrapper(embeddings)
 
-    # Inject models into metrics
+    # Inject models into metrics (using 2 core metrics for fast local execution)
     metrics = [
         Faithfulness(),
-        AnswerRelevancy(),
-        ContextPrecision(),
-        ContextRecall()
+        AnswerRelevancy()
     ]
     for metric in metrics:
         metric.llm = ragas_llm
@@ -132,7 +128,7 @@ def run_evaluation():
 
     # 6. Evaluate
     print("\nComputing Ragas metrics...")
-    run_config = RunConfig(max_workers=2, timeout=120)
+    run_config = RunConfig(max_workers=1, timeout=600)
     results = evaluate(
         dataset=eval_dataset,
         metrics=metrics,
