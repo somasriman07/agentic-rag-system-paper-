@@ -9,7 +9,7 @@ from tavily import TavilyClient
 from Backend.models import BtwRouteDecision
 from Backend.llm_factory import get_llm
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 

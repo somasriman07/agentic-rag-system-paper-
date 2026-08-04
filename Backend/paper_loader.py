@@ -29,23 +29,23 @@ def _stamp_title(docs: list[Document], title: str) -> list[Document]:
 
 def load_pdf(file_path: str) -> list[Document]:
     docs = PyMuPDFLoader(file_path).load()
-    return _stamp_title(_splitter.split_documents(docs), Path(file_path).stem)
+    return _stamp_title(docs, Path(file_path).stem)
 
 
 def load_text(file_path: str) -> list[Document]:
     docs = TextLoader(file_path, encoding="utf-8").load()
-    return _stamp_title(_splitter.split_documents(docs), Path(file_path).stem)
+    return _stamp_title(docs, Path(file_path).stem)
 
 
 def load_markdown(file_path: str) -> list[Document]:
     docs = TextLoader(file_path, encoding="utf-8").load()
-    return _stamp_title(_md_splitter.split_documents(docs), Path(file_path).stem)
+    return _stamp_title(docs, Path(file_path).stem)
 
 
 def load_webpage(url: str) -> list[Document]:
     docs = WebBaseLoader(url, requests_kwargs={"timeout": 30}).load()
     title = (docs[0].metadata.get("title") or url) if docs else url
-    return _stamp_title(_splitter.split_documents(docs), title)
+    return _stamp_title(docs, title)
 
 
 def _extract_arxiv_id(query: str) -> str | None:
@@ -92,7 +92,7 @@ def _load_arxiv_by_id(arxiv_id: str) -> list[Document]:
         if not docs:
             raise ValueError(f"Could not load PDF for ArXiv ID: {arxiv_id}")
         title = (docs[0].metadata.get("title") or "").strip() or _arxiv_api_lookup(arxiv_id)
-        return _stamp_title(_splitter.split_documents(docs), title)
+        return _stamp_title(docs, title)
     finally:
         if tmp_path:
             Path(tmp_path).unlink(missing_ok=True)

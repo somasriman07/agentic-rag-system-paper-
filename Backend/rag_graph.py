@@ -21,7 +21,7 @@ from tavily import TavilyClient
 from Backend.models import ClaimVerificationResult, RelevancyDecision, RouterDecision
 from Backend.vector_store import search as vs_search
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 

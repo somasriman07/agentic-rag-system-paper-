@@ -11,7 +11,7 @@ from langchain_core.messages import HumanMessage
 from Backend.btw_handler import handle_btw
 from Backend.paper_loader import load_arxiv, load_document, load_webpage
 from Backend.rag_graph import build_graph
-from Backend.vector_store import add_paper, list_papers
+from Backend.vector_store import add_paper, list_papers, base_model_name, get_embedding_dimension
 from Backend.llm_factory import get_llm
 
 st.set_page_config(page_title="Papeer", page_icon="📚", layout="centered")
@@ -164,6 +164,7 @@ with st.sidebar:
         st.session_state.active_session_id = new_sid
         active_sid = new_sid
         st.rerun()
+    st.caption(f"🤖 **Embedding:** `{base_model_name}` ({get_embedding_dimension()} dim)")
     st.divider()
     st.markdown("## 💬 Sessions")
 
