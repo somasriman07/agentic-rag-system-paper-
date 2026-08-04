@@ -209,7 +209,7 @@ def agent_node(state: RAGState) -> dict:
 def relevancy_check_node(state: RAGState) -> dict:
     query = state["query"]
     docs = state.get("retrieved_docs") or []
-    doc_snippets = "\n\n---\n\n".join(doc.page_content[:300] for doc in docs[:3])
+    doc_snippets = "\n\n---\n\n".join(doc.page_content for doc in docs[:3])
     if not doc_snippets:
         return {"is_relevant": False}
     prompt = (
