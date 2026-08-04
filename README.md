@@ -167,7 +167,7 @@ This is currently a solo learning/portfolio project, but issues and suggestions 
 
 ## 📬 Contact
 
-Built by **Sriman Soma** — feel free to connect on [LinkedIn](#) or reach out via email.
+Built by **Sriman Soma** — feel free to connect on [www.linkedin.com/in/srimansoma](#) or reach out via email.
 
 ---
 
