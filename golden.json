@@ -1,0 +1,14 @@
+[
+  {
+    "question": "what are the different deployment options for moltbot as per the report",
+    "ground_truth": "Moltbot supports multiple deployment models including Local Mac/PC, VPS Cloud (e.g., DigitalOcean, Linode), Raspberry Pi, and Docker containers."
+  },
+  {
+    "question": "What is the typical cost of running Moltbot on a VPS Cloud?",
+    "ground_truth": "The typical cost of running Moltbot on a VPS Cloud is $5 to $24 per month."
+  },
+  {
+    "question": "What local hardware option is listed with a dedicated one-time cost of $500-800?",
+    "ground_truth": "A dedicated Mac Mini is listed with a dedicated one-time cost of $500 to $800."
+  }
+]

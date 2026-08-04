@@ -49,3 +49,7 @@ llm_factory.py        embedding_factory.py
              Streamlit
    -> Also added the stateless memory in the chat history .
 7. After this at infernce stage, i tested the retriver , it is not retrived the correct documents i mean it is not hallucianate it is saying the i do't have the answer ,so i implemented the parent document retrivered where parent documents store in local file store 
+
+with the parentdocument retriveal it was retrived correctly and got answers correctly !!! uff.
+
+8. started evaluation usin the ragas with those 5 matrix and trying to interpret them .

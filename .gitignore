@@ -221,3 +221,6 @@ __marimo__/
 
 # Parent Document Store local cache
 parent_document_store/
+
+# Evaluation results
+evaluation_results.json
