@@ -104,7 +104,8 @@ def run_evaluation():
         api_key=os.environ.get("GEMINI_API_KEY"),
         temperature=0
     )
-    embeddings = get_embedding_model()
+    from langchain_huggingface import HuggingFaceEmbeddings
+    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
     
     ragas_llm = LangchainLLMWrapper(judge_llm)
     ragas_embeddings = LangchainEmbeddingsWrapper(embeddings)
