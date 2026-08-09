@@ -16,6 +16,7 @@ def get_llm():
         return ChatOllama(
             model=os.getenv("OLLAMA_MODEL", "qwen2.5:7b"),
             temperature=0,
+            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         )
 
     elif provider == "openai":

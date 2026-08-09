@@ -97,26 +97,34 @@ def run_evaluation():
     # 4. Initialize Ragas models
     print("\nInitializing Ragas evaluation models...")
     
-    # Use local Ollama model for evaluation
-    judge_llm = get_llm()
+    from google import genai
+    from ragas.llms import llm_factory
     from langchain_huggingface import HuggingFaceEmbeddings
-    embeddings = HuggingFaceEmbeddings(
-        model_name="BAAI/bge-base-en-v1.5",
-        model_kwargs={"device": "cpu"}
-    )
-    
-    ragas_llm = LangchainLLMWrapper(judge_llm)
-    ragas_embeddings = LangchainEmbeddingsWrapper(embeddings)
+    from ragas.embeddings import LangchainEmbeddingsWrapper
 
-    # Inject models into metrics (using 2 core metrics for fast local execution)
-    metrics = [
-        Faithfulness(),
-        AnswerRelevancy()
-    ]
-    for metric in metrics:
-        metric.llm = ragas_llm
-        if hasattr(metric, "embeddings"):
-            metric.embeddings = ragas_embeddings
+    # Use Gemini specifically for evaluation if key is available to avoid NaN scores 
+    # resulting from local Ollama models failing to output the correct structure.
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if gemini_api_key:
+        print("Using Gemini 1.5 Flash (gemini-flash-latest) for evaluation (robust structured output, high free-tier quota)")
+        client = genai.Client(api_key=gemini_api_key)
+        ragas_llm = llm_factory(
+            "gemini-flash-latest",
+            provider="google",
+            client=client,
+            max_retries=10
+        )
+    else:
+        print("Warning: GEMINI_API_KEY not found. Using local LLM for evaluation (might cause NaN scores for some metrics)")
+        judge_llm = get_llm()
+        ragas_llm = LangchainLLMWrapper(judge_llm)
+
+    embeddings = LangchainEmbeddingsWrapper(
+        HuggingFaceEmbeddings(
+            model_name="BAAI/bge-base-en-v1.5",
+            model_kwargs={"device": "cpu"}
+        )
+    )
 
     # 5. Build HF Dataset
     eval_dataset = Dataset.from_dict({
@@ -126,31 +134,70 @@ def run_evaluation():
         "ground_truth": ground_truths
     })
 
+    # Include all 4 core Ragas metrics
+    metrics = [
+        Faithfulness(),
+        AnswerRelevancy(),
+        ContextPrecision(),
+        ContextRecall()
+    ]
+
     # 6. Evaluate
     print("\nComputing Ragas metrics...")
-    run_config = RunConfig(max_workers=1, timeout=600)
-    results = evaluate(
-        dataset=eval_dataset,
-        metrics=metrics,
-        run_config=run_config
-    )
+    
+    # We evaluate metrics sequentially with a small delay if using Gemini to prevent hitting API rate limits
+    if gemini_api_key:
+        import time
+        combined_scores = []
+        # Prepopulate the list of score dicts
+        for _ in range(len(questions)):
+            combined_scores.append({})
+            
+        for i, metric in enumerate(metrics):
+            print(f"Evaluating metric {i+1}/{len(metrics)}: {metric.name}...")
+            try:
+                res = evaluate(
+                    dataset=eval_dataset,
+                    metrics=[metric],
+                    llm=ragas_llm,
+                    embeddings=embeddings,
+                    run_config=RunConfig(max_workers=1, timeout=600)
+                )
+                # Merge individual metric scores into the list of scores
+                metric_scores = res.scores
+                for idx, row_score in enumerate(metric_scores):
+                    combined_scores[idx].update(row_score)
+            except Exception as e:
+                print(f"Error evaluating metric {metric.name}: {e}")
+                
+            if i < len(metrics) - 1:
+                print("Sleeping for 15 seconds to prevent rate limit...")
+                time.sleep(15)
+        
+        results_out = combined_scores
+    else:
+        # Fallback to direct evaluate if using local model
+        for metric in metrics:
+            metric.llm = ragas_llm
+            if hasattr(metric, "embeddings"):
+                metric.embeddings = embeddings
+        run_config = RunConfig(max_workers=1, timeout=600)
+        results = evaluate(
+            dataset=eval_dataset,
+            metrics=metrics,
+            run_config=run_config
+        )
+        print(results)
+        results_out = results.scores if hasattr(results, "scores") else results
 
     print("\n" + "="*50)
     print("EVALUATION COMPLETED SUCCESSFULLY")
     print("="*50)
-    print(results)
+    print(results_out)
     
     # Save results as a local JSON report
     with open("evaluation_results.json", "w", encoding="utf-8") as f:
-        # Convert EvaluationResult to a python dict safely
-        out_dict = {}
-        if hasattr(results, "to_dict"):
-            out_dict = results.to_dict()
-        elif hasattr(results, "scores"):
-            out_dict = results.scores
-        else:
-            out_dict = dict(results)
-        json.dump(out_dict, f, indent=2)
+        json.dump(results_out, f, indent=2)
     print("\nResults saved to evaluation_results.json")
 
 if __name__ == "__main__":
