@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import sqlite3
 import warnings
 from typing import Annotated
@@ -50,34 +52,38 @@ class RAGState(MessagesState):
 ROUTER_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You are a routing assistant for a research paper Q&A system. "
-        "Classify the user query into exactly one of three categories:\n\n"
-        "  retrieve — Use this for TWO types of questions:\n"
-        "    (a) Questions about the content of uploaded research papers "
-        "(e.g. methods, results, conclusions, authors).\n"
-        "    (b) Questions that require live or current information that cannot be "
-        "answered from general knowledge alone — such as current events, today's weather, "
-        "live prices, recent news, or anything where the answer changes over time "
-        "(e.g. 'Who is the current president?', 'What is the price of gold today?', "
-        "'What is the weather in Delhi?').\n"
-        "  verify_claim — The user wants to check whether a specific claim or finding "
-        "from a paper is still accurate or has been superseded.\n"
-        "  direct_answer — A stable general knowledge question answerable from training data "
-        "with no retrieval needed (e.g. 'What is softmax?', 'Who invented the transformer?', "
-        "'Explain backpropagation.').\n\n"
-        "When in doubt between retrieve and direct_answer, prefer retrieve.\n\n"
-        "Return only the route field.",
+        "You are a routing assistant for a research paper Q&A system.\n"
+        "Classify the user query into exactly one category: 'retrieve', 'verify_claim', or 'direct_answer'.\n"
+        "- retrieve: Questions about research papers, documents, or live data.\n"
+        "- verify_claim: Checking if a claim is superseded by newer work.\n"
+        "- direct_answer: Pure general knowledge questions.\n"
+        "When in doubt, choose 'retrieve'.\n"
+        "Return ONLY a JSON object: {{\"route\": \"retrieve\"}} or {{\"route\": \"verify_claim\"}} or {{\"route\": \"direct_answer\"}}."
     ),
     ("human", "{query}"),
 ])
 
-router_chain = ROUTER_PROMPT | llm.with_structured_output(RouterDecision)
+router_chain = ROUTER_PROMPT | llm
 
 
 def router_node(state: RAGState) -> dict:
     query = state["messages"][-1].content
-    decision: RouterDecision = router_chain.invoke({"query": query})
-    return {"route": decision.route}
+    try:
+        response = router_chain.invoke({"query": query})
+        content = str(response.content if hasattr(response, "content") else response).strip()
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if match:
+            data = json.loads(match.group(0))
+            route = data.get("route", "retrieve")
+            if route in ("retrieve", "verify_claim", "direct_answer"):
+                return {"route": route}
+        if "verify" in content.lower():
+            return {"route": "verify_claim"}
+        if "direct" in content.lower():
+            return {"route": "direct_answer"}
+        return {"route": "retrieve"}
+    except Exception:
+        return {"route": "retrieve"}
 
 
 # ── Tool schemas ──────────────────────────────────────────────────────────────
@@ -161,24 +167,8 @@ RETRIEVE_SYSTEM = (
     "   - max_results: how many results to fetch (1–10)\n\n"
     "Choose the right source based on the question:\n"
     "- Questions about the uploaded papers → use retrieve_from_vectorstore\n"
-    "- Questions about current events, recent developments, or supplementary information → use web_search\n"
-    "- Call only one tool per turn.\n\n"
     "Do NOT produce a final answer. Only call tools to collect context."
 )
-
-
-# ── Relevancy check ───────────────────────────────────────────────────────────
-
-RELEVANCY_CHECK_SYSTEM = (
-    "You are evaluating whether retrieved document chunks are relevant enough "
-    "to answer a user's question about research papers.\n\n"
-    "Return is_relevant=true if the chunks contain information that meaningfully "
-    "addresses the question — even partially. "
-    "Return is_relevant=false only if the chunks are clearly off-topic or contain "
-    "no useful information.\n\nBe lenient: if there is any substantive overlap, return true."
-)
-
-relevancy_llm = llm.with_structured_output(RelevancyDecision)
 
 QUERY_REWRITE_SYSTEM = (
     "You are a query rewriting assistant for a research paper retrieval system. "
@@ -193,17 +183,30 @@ QUERY_REWRITE_SYSTEM = (
 
 def agent_node(state: RAGState) -> dict:
     current_attempts = state.get("retrieval_attempts", 0)
-    # Once at the cap, use plain LLM so the agent cannot emit more tool calls.
-    # This prevents orphaned tool_call IDs from entering the persisted message history.
-    # retrieval llm --> tool call --> tool result
-    # llm --> no tools are bounded --> tool call
-    lm = llm if current_attempts >= MAX_RETRIEVAL_ATTEMPTS else retrieval_llm
+    if current_attempts >= MAX_RETRIEVAL_ATTEMPTS:
+        return {}
     messages = [{"role": "system", "content": RETRIEVE_SYSTEM}] + state["messages"]
-    response = lm.invoke(messages)
+    response = retrieval_llm.invoke(messages)
     updates: dict = {"messages": [response]}
     if getattr(response, "tool_calls", None):
         updates["retrieval_attempts"] = current_attempts + 1
     return updates
+
+
+# ── Relevancy check ───────────────────────────────────────────────────────────
+
+RELEVANCY_CHECK_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You evaluate whether retrieved document chunks contain relevant information "
+        "to answer the user's question about research papers.\n"
+        "Be lenient: if there is any substantive overlap or relevant context, mark is_relevant as 'yes'.\n"
+        "Return ONLY a JSON object: {{\"is_relevant\": \"yes\", \"reason\": \"...\"}} or {{\"is_relevant\": \"no\", \"reason\": \"...\"}}."
+    ),
+    ("human", "Question: {query}\n\nRetrieved Chunks:\n{chunks}\n\nJSON decision:"),
+])
+
+relevancy_chain = RELEVANCY_CHECK_PROMPT | llm
 
 
 def relevancy_check_node(state: RAGState) -> dict:
@@ -212,15 +215,17 @@ def relevancy_check_node(state: RAGState) -> dict:
     doc_snippets = "\n\n---\n\n".join(doc.page_content for doc in docs[:3])
     if not doc_snippets:
         return {"is_relevant": False}
-    prompt = (
-        f"Question: {query}\n\nRetrieved chunks:\n{doc_snippets}\n\n"
-        "Are these chunks relevant to answering the question?"
-    )
-    decision: RelevancyDecision = relevancy_llm.invoke([
-        {"role": "system", "content": RELEVANCY_CHECK_SYSTEM},
-        {"role": "user", "content": prompt},
-    ])
-    return {"is_relevant": decision.is_relevant}
+    try:
+        response = relevancy_chain.invoke({"query": query, "chunks": doc_snippets})
+        content = str(response.content if hasattr(response, "content") else response).strip()
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if match:
+            data = json.loads(match.group(0))
+            is_rel = str(data.get("is_relevant", "")).strip().lower() in ("yes", "true", "1")
+            return {"is_relevant": is_rel}
+        return {"is_relevant": "yes" in content.lower() or "true" in content.lower()}
+    except Exception:
+        return {"is_relevant": True}
 
 
 def query_rewrite_node(state: RAGState) -> dict:
@@ -323,11 +328,12 @@ def generate_answer_node(state: RAGState) -> dict:
         else:
             docs = state.get("retrieved_docs") or []
             if not docs:
-                answer = "I don't know the answer."
+                answer = "I don't know the answer based on the provided documents."
             else:
-                context = "\n\n---\n\n".join(doc.page_content for doc in docs)
+                selected_docs = docs[:3]
+                context = "\n\n---\n\n".join(doc.page_content[:1500] for doc in selected_docs)
                 system_content = (
-                    "You are a helpful research assistant. Answer the user's question using the retrieved document context and the conversation history.\n\n"
+                    "You are a helpful research assistant. Answer the user's question concisely using the retrieved document context and conversation history.\n\n"
                     f"Retrieved Context:\n{context}"
                 )
                 system_message = SystemMessage(content=system_content)
@@ -365,7 +371,8 @@ def generate_answer_node(state: RAGState) -> dict:
         messages = [system_message] + state["messages"]
         answer = llm.invoke(messages).content
 
-    return {"answer": answer, "messages": [AIMessage(content=answer)]}
+    clean_answer = re.sub(r"<think>[\s\S]*?</think>", "", str(answer)).strip()
+    return {"answer": clean_answer, "messages": [AIMessage(content=clean_answer)]}
 
 
 # ── Graph ─────────────────────────────────────────────────────────────────────

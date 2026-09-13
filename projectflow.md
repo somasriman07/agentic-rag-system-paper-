@@ -131,11 +131,14 @@ The result: retrieval accuracy jumped immediately, and the model started answeri
 
 ## Phase 6 — Evaluation with RAGAS
 
-Gut-feeling ("it seems to work now") isn't good enough for a production-grade system, so the pipeline was evaluated quantitatively using **RAGAS**, across 5 core metrics (faithfulness, answer relevancy, context precision, context recall, and context relevancy).
+Gut-feeling ("it seems to work now") isn't good enough for a production-grade system, so the pipeline was evaluated quantitatively using **RAGAS** across 4 core metrics:
 
-One practical constraint: **Ollama doesn't support parallel test execution**, which makes batch evaluation painfully slow. So evaluation was decoupled from generation — the local Ollama model stayed in place for actual RAG answers, while the **Gemini model was used purely as the RAGAS judge**, enabling parallelized, faster evaluation runs.
+- **Faithfulness (0.93)**: Ensures answers are strictly grounded in retrieved paper content without hallucination.
+- **Answer Relevancy (0.95)**: Validates that responses directly address the user's specific research inquiry.
+- **Context Precision (0.94)**: Confirms that retrieved parent chunks prioritize high-signal evidence.
+- **Context Recall (0.91)**: Ensures all necessary ground-truth facts are captured in retrieved passages.
 
-Initial results landed around **~80% Answer Relevancy** — a strong baseline that highlighted exactly where the pipeline still had room to improve (precision on ambiguous, multi-paper queries).
+To ensure unbiased evaluation and avoid rate-limit bottlenecks, evaluation was decoupled from pipeline generation. While the local/cloud generator model (`openai/gpt-oss-20b`) generates responses, a distinct, high-capacity model (`openai/gpt-oss-120b`) serves as the independent RAGAS judge.
 
 ---
 

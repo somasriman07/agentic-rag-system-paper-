@@ -222,5 +222,14 @@ __marimo__/
 # Parent Document Store local cache
 parent_document_store/
 
-# Evaluation results
-evaluation_results.json
+# Runtime state — contains real chat history / uploaded paper titles.
+# Should never be committed; see README for how sessions are recreated locally.
+checkpoints.db
+sessions.json
+scratch/
+
+# User-uploaded source documents (not project assets)
+Documents/
+
+# macOS
+.DS_Store

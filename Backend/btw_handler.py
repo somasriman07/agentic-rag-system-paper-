@@ -3,7 +3,6 @@ from typing import Generator
 
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama
 from tavily import TavilyClient
 
 from Backend.models import BtwRouteDecision
@@ -26,7 +25,7 @@ def handle_btw(query: str) -> Generator[str, None, None]:
     ])
     decision = (route_prompt | llm.with_structured_output(BtwRouteDecision)).invoke({"query": query})
 
-    if decision.needs_web_search:
+    if decision.needs_web_search_bool:
         client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
         results = client.search(query, max_results=3)
         context = "\n\n".join(r["content"] for r in results["results"])

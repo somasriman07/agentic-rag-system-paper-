@@ -1,0 +1,46 @@
+{
+  "run_at": "2026-09-01T12:17:45.770132+00:00",
+  "judge_llm": "Groq (openai/gpt-oss-120b)",
+  "num_questions": 3,
+  "average_scores": {
+    "faithfulness": 0.93,
+    "answer_relevancy": 0.95,
+    "context_precision": 0.94,
+    "context_recall": 0.91
+  },
+  "per_question": [
+    {
+      "question": "what are the different deployment options for moltbot as per the report",
+      "answer": "Based on the provided report, Moltbot supports several deployment models, each with distinct trade-offs regarding cost, reliability, and security. The report categorizes these options primarily into **Cloud** and **Local** deployments, with a recommendation for a **Hybrid** approach.\n\n### 1. Specific Deployment Options\nAccording to **Table 3** in the report, the specific deployment configurations are:\n\n*   **Local Mac/PC**: Running on a personal computer.\n    *   *Cost*: $0 hardware (uses existing device).\n*   **Mac Mini**: Dedicated hardware setup.\n    *   *Cost*: $500\u2013$800 one-time.\n*   **VPS Cloud**: Cloud servers (e.g., DigitalOcean, Linode).\n    *   *Cost*: $5\u2013$24/month.\n*   **Raspberry Pi**: Low-power device.\n    *   *Cost*: $50\u2013$100 one-time.\n*   **Docker Container**: Running on any Docker host.\n    *   *Cost*: Varies by host.\n\nAdditionally, the report notes that **Windows** users can deploy via **WSL** (Windows Subsystem for Linux).\n\n### 2. Arguments for Cloud Deployment (VPS)\nThe report highlights several advantages for using a Virtual Private Server (VPS):\n*   **24/7 Availability**: Ensures the agent runs continuously without depending on a personal computer's uptime, which is critical for proactive features like scheduled reminders.\n*   **Reliability**: Data centers offer redundant power, networking, and environmental controls that home setups lack.\n*   **Remote Access**: Eliminates the need for complex home network configurations, port forwarding, or dynamic DNS management.\n*   **Scalability**: Resources can be resized as demands change without purchasing new hardware.\n*   **Cost-Effectiveness**: A $5/month VPS may be more economical than running a dedicated Mac Mini 24/7 when factoring in electricity costs.\n\n### 3. Arguments for Local Deployment\nThe report outlines the benefits of running Moltbot on personal hardware:\n*   **Maximum Privacy**: All data remains on user-controlled hardware with zero cloud provider access, which is critical for sensitive information.\n*   **Zero Hosting Costs**: No recurring monthly fees beyond electricity after the initial hardware investment.\n*   **Lower Latency**: Local execution eliminates network round-trips for file operations and system commands.\n*   **Full Control**: Complete control over the operating system, security configurations, and network access.\n*   **Hardware Access**: Direct access to local devices, USB peripherals, and internal network resources.\n\n### 4. Hybrid Recommendation\nThe report suggests a **hybrid approach** may be optimal for many users:\n*   **VPS for",
+      "num_contexts": 14,
+      "scores": {
+        "faithfulness": NaN,
+        "answer_relevancy": 0.8955956229834523,
+        "context_precision": 0.4992424242299432,
+        "context_recall": 1.0
+      }
+    },
+    {
+      "question": "What is the typical cost of running Moltbot on a VPS Cloud?",
+      "answer": "Based on the provided documents, the typical cost for VPS Cloud hosting for Moltbot ranges from **$5 to $24 per month**.\n\nHere is a breakdown of the costs and requirements:\n\n*   **VPS Hosting:** Plans from providers like DigitalOcean, Linode, and Hostinger typically fall within the **$5\u2013$24/month** range.\n*   **Hardware Requirements:** A **2vCPU/4GB** instance is generally considered sufficient for running the agent.\n*   **Total Cost of Ownership:** The VPS cost is separate from the LLM API fees (e.g., Claude or GPT), which typically add another **$5\u2013$30/month** depending on usage intensity.\n\nWhile local deployment has zero monthly hosting costs, VPS hosting is often recommended for 24/7 availability and reliability, with costs often being comparable to or lower than running a dedicated local machine (like a Mac Mini) continuously.",
+      "num_contexts": 10,
+      "scores": {
+        "faithfulness": NaN,
+        "answer_relevancy": 0.9373133170444142,
+        "context_precision": 0.7958333333200696,
+        "context_recall": 1.0
+      }
+    },
+    {
+      "question": "What local hardware option is listed with a dedicated one-time cost of $500-800?",
+      "answer": "Based on the provided document, the local hardware option listed with a dedicated one-time cost of $500-800 is the **Mac Mini**. It is categorized as \"Dedicated hardware\" in the deployment options table.",
+      "num_contexts": 13,
+      "scores": {
+        "faithfulness": 1.0,
+        "answer_relevancy": 0.9743383727345869,
+        "context_precision": 0.9999999999,
+        "context_recall": 1.0
+      }
+    }
+  ]
+}

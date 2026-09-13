@@ -1,14 +1,212 @@
 [
   {
-    "question": "what are the different deployment options for moltbot as per the report",
-    "ground_truth": "Moltbot supports multiple deployment models including Local Mac/PC, VPS Cloud (e.g., DigitalOcean, Linode), Raspberry Pi, and Docker containers."
+    "id": 1,
+    "category": "factual",
+    "question": "What was the original name of Moltbot before its rebranding, and why was it renamed?",
+    "ground_truth": "The original name was Clawdbot. It was renamed to Moltbot following a trademark dispute with Anthropic to avoid confusion with their Claude AI brand."
   },
   {
-    "question": "What is the typical cost of running Moltbot on a VPS Cloud?",
-    "ground_truth": "The typical cost of running Moltbot on a VPS Cloud is $5 to $24 per month."
+    "id": 2,
+    "category": "factual",
+    "question": "What are the five deployment models listed in Table 3 of the report?",
+    "ground_truth": "The five deployment models listed are Local Mac/PC, Mac Mini, VPS Cloud, Raspberry Pi, and Docker Container."
   },
   {
-    "question": "What local hardware option is listed with a dedicated one-time cost of $500-800?",
-    "ground_truth": "A dedicated Mac Mini is listed with a dedicated one-time cost of $500 to $800."
+    "id": 3,
+    "category": "factual",
+    "question": "What is the estimated one-time hardware cost of running Moltbot on a dedicated Mac Mini?",
+    "ground_truth": "A dedicated Mac Mini is listed with an estimated one-time hardware cost of $500 to $800."
+  },
+  {
+    "id": 4,
+    "category": "factual",
+    "question": "What is the typical monthly cost range for hosting Moltbot on a VPS Cloud like DigitalOcean or Linode?",
+    "ground_truth": "The typical cost for hosting Moltbot on a VPS Cloud ranges from $5 to $24 per month."
+  },
+  {
+    "id": 5,
+    "category": "factual",
+    "question": "What is the one-time hardware cost listed for a Raspberry Pi deployment?",
+    "ground_truth": "A Raspberry Pi deployment is listed with a one-time hardware cost of $50 to $100."
+  },
+  {
+    "id": 6,
+    "category": "factual",
+    "question": "What is the recommended one-line installation command for Moltbot on macOS and Linux?",
+    "ground_truth": "The one-line installation command is: curl -fsSL https://molt.bot/install.sh | bash"
+  },
+  {
+    "id": 7,
+    "category": "factual",
+    "question": "What file does Moltbot use to store user preferences and personality definitions for persistent memory?",
+    "ground_truth": "Moltbot uses the Soul.md (or SOUL.md) personality and preference file to store long-term user context and instructions."
+  },
+  {
+    "id": 8,
+    "category": "factual",
+    "question": "What core programming language and runtime framework does Moltbot use?",
+    "ground_truth": "Moltbot is built using Node.js and TypeScript."
+  },
+  {
+    "id": 9,
+    "category": "factual",
+    "question": "Which browser automation tool is integrated into Moltbot for web browsing and scraping?",
+    "ground_truth": "Moltbot integrates Microsoft Playwright for automated browser control and web interaction."
+  },
+  {
+    "id": 10,
+    "category": "factual",
+    "question": "What messaging platforms does Moltbot natively integrate with for multi-channel communication?",
+    "ground_truth": "Moltbot integrates with WhatsApp, Telegram, Discord, Slack, and iMessage."
+  },
+  {
+    "id": 11,
+    "category": "factual",
+    "question": "What minimum hardware specifications are recommended for a basic Moltbot installation?",
+    "ground_truth": "The recommended minimum hardware specifications are 2 vCPU, 4GB RAM, and 20GB storage."
+  },
+  {
+    "id": 12,
+    "category": "factual",
+    "question": "What service or tool is recommended for securely exposing the Moltbot Control UI dashboard remotely?",
+    "ground_truth": "Tailscale Serve/Funnel is recommended for secure remote exposure, or SSH tunnels with token/password authentication."
+  },
+  {
+    "id": 13,
+    "category": "factual",
+    "question": "According to Table 6, what is the estimated monthly LLM API cost range for a moderate user?",
+    "ground_truth": "The estimated monthly LLM API cost for a moderate user is $20 to $60 per month."
+  },
+  {
+    "id": 14,
+    "category": "factual",
+    "question": "What second name change occurred after Moltbot due to ongoing trademark concerns?",
+    "ground_truth": "Following further trademark concerns, the project announced a second rename from Moltbot to OpenClaw."
+  },
+  {
+    "id": 15,
+    "category": "factual",
+    "question": "What protocol does Moltbot use for real-time streaming and communication between the Gateway and client interfaces?",
+    "ground_truth": "Moltbot utilizes WebSocket connections with a JSON-RPC protocol for real-time streaming and bidirectional communication."
+  },
+  {
+    "id": 16,
+    "category": "multi-hop",
+    "question": "How do the trade-offs between VPS cloud deployment and local Mac Mini deployment compare regarding reliability and electricity costs?",
+    "ground_truth": "A VPS Cloud offers 24/7 availability and data center reliability (redundant power and networking) without local failure risks, and at $5-24/month is often more cost-effective than running a dedicated Mac Mini continuously after accounting for power consumption."
+  },
+  {
+    "id": 17,
+    "category": "multi-hop",
+    "question": "What are the primary data privacy advantages of deploying Moltbot locally compared to cloud VPS?",
+    "ground_truth": "Local deployment guarantees that all personal files, credentials, and conversation histories remain strictly on user-owned hardware with zero cloud provider access, eliminating third-party data exposure risks."
+  },
+  {
+    "id": 18,
+    "category": "multi-hop",
+    "question": "How does Moltbot persistent memory system handle context degradation across long-running sessions?",
+    "ground_truth": "Moltbot maintains user preferences and key facts in Soul.md, periodically summarizing and updating long-term knowledge to avoid overflowing model context windows during long sessions."
+  },
+  {
+    "id": 19,
+    "category": "multi-hop",
+    "question": "What security risk arises from storing plaintext API keys and credentials in Moltbot configuration files?",
+    "ground_truth": "Storing credentials in plaintext files allows local malware, infostealers, or unauthorized processes with read access to extract sensitive API keys and tokens without requiring root permissions."
+  },
+  {
+    "id": 20,
+    "category": "multi-hop",
+    "question": "How can prompt injection attacks manipulate Moltbot when it processes external web content or emails?",
+    "ground_truth": "Untrusted external content can embed hidden instructions that override system prompts, hijacking the agent to execute unauthorized tool commands, exfiltrate private data, or perform unintended file operations."
+  },
+  {
+    "id": 21,
+    "category": "multi-hop",
+    "question": "What are the supply chain risks associated with installing unvetted community skills in Moltbot?",
+    "ground_truth": "Community skills run with the agent full permissions; unvetted or auto-updating packages could contain malicious code, backdoors, or compromised dependencies that steal secrets or compromise the host system."
+  },
+  {
+    "id": 22,
+    "category": "multi-hop",
+    "question": "Why does the report recommend a hybrid deployment model for users requiring both 24/7 responsiveness and local file access?",
+    "ground_truth": "A hybrid deployment leverages a lightweight VPS for 24/7 uptime, notifications, and messaging gateway while tunneling sensitive file operations and heavy compute tasks to an isolated local machine."
+  },
+  {
+    "id": 23,
+    "category": "multi-hop",
+    "question": "How does Moltbot differ from traditional passive chatbots like ChatGPT in terms of task execution?",
+    "ground_truth": "Unlike passive chatbots that only generate text, Moltbot is an agentic framework that directly executes shell commands, automates browser actions via Playwright, integrates with communication channels, and runs autonomous proactive workflows."
+  },
+  {
+    "id": 24,
+    "category": "multi-hop",
+    "question": "What network vulnerability occurs when Moltbot Gateway ports are exposed directly to the public internet without authentication?",
+    "ground_truth": "Exposing Gateway ports without strict authentication or firewall rules allows automated scanners on Shodan to discover instances, enabling unauthenticated remote command execution on the host."
+  },
+  {
+    "id": 25,
+    "category": "multi-hop",
+    "question": "What are the phased rollout recommendations for safely adopting Moltbot in an organization?",
+    "ground_truth": "Organizations should start in an isolated test environment (VM/dedicated hardware), enforce a security baseline, begin with read-only skills, strictly audit community skill code, and establish credential rotation procedures."
+  },
+  {
+    "id": 26,
+    "category": "multi-hop",
+    "question": "How does Moltbot proactive behavior mechanism differ from reactive user-prompted workflows?",
+    "ground_truth": "Moltbot uses background heartbeat routines, cron timers, and event webhooks to autonomously initiate actions like reminders and monitoring without waiting for incoming user prompts."
+  },
+  {
+    "id": 27,
+    "category": "multi-hop",
+    "question": "What is the comparative cost advantage of Moltbot compared to commercial AI agents like OpenAI Operator?",
+    "ground_truth": "Moltbot is open-source without proprietary subscription markups, allowing users to pay only direct model API token costs and cheap VPS hosting rather than expensive fixed enterprise seats."
+  },
+  {
+    "id": 28,
+    "category": "multi-hop",
+    "question": "How does Windows Subsystem for Linux (WSL2) facilitate Moltbot installation on Windows systems?",
+    "ground_truth": "WSL2 provides a native Linux environment and systemd support required for Moltbot Unix-centric architecture, avoiding Windows path format issues and process management incompatibilities."
+  },
+  {
+    "id": 29,
+    "category": "multi-hop",
+    "question": "What mitigation strategy does the report suggest to prevent accidental destructive tool actions by the agent?",
+    "ground_truth": "The report recommends implementing human-in-the-loop confirmation prompts for high-risk operations, enforcing least-privilege permissions, and restricting file modification boundaries."
+  },
+  {
+    "id": 30,
+    "category": "multi-hop",
+    "question": "How do user reviews characterize the learning curve and configuration difficulty of Moltbot?",
+    "ground_truth": "Reviews highlight that initial setup requires command-line proficiency, environment variable configuration, and API key management, presenting friction for non-technical users despite quick-install scripts."
+  },
+  {
+    "id": 31,
+    "category": "negative",
+    "question": "What quantum post-cryptography algorithm does Moltbot use to encrypt its SQLite vector embeddings?",
+    "ground_truth": "The report does not mention any quantum post-cryptography algorithms or SQLite vector embedding encryption for Moltbot."
+  },
+  {
+    "id": 32,
+    "category": "negative",
+    "question": "What is the price of the Moltbot Enterprise SLA tier with 99.99% uptime guarantee provided by the core developers?",
+    "ground_truth": "The report does not list any official Moltbot Enterprise SLA tier or 99.99% uptime guarantee pricing, as it is an open-source project."
+  },
+  {
+    "id": 33,
+    "category": "negative",
+    "question": "How do you install the native Moltbot iOS IPA application directly from the Apple App Store?",
+    "ground_truth": "The report does not mention a native iOS App Store application or IPA package; Moltbot operates via backend services and messaging bridges rather than a native App Store app."
+  },
+  {
+    "id": 34,
+    "category": "negative",
+    "question": "What specific Rust-based rewrite release date is scheduled for replacing the Node.js core gateway?",
+    "ground_truth": "The report does not specify any scheduled release date for a Rust-based core gateway rewrite."
+  },
+  {
+    "id": 35,
+    "category": "negative",
+    "question": "What is the dedicated Microsoft Azure Sovereign Government Cloud deployment cost for Moltbot?",
+    "ground_truth": "The report does not provide pricing or specifications for Microsoft Azure Sovereign Government Cloud deployments."
   }
 ]
