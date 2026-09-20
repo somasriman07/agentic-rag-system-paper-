@@ -15,7 +15,7 @@ Most RAG demos stop at "upload a PDF, ask a question." Papeer goes further — i
 - 📊 **Evaluated with RAGAS** across 4 core dimensions: **0.93 Faithfulness**, **0.95 Answer Relevancy**, **0.94 Context Precision**, and **0.91 Context Recall**.
 - 🔀 **Hybrid retrieval** (BM25 + dense embeddings + MMR) so exact terminology *and* conceptual questions both get answered well.
 
-Read the full engineering story in [`PROJECT_FLOW.md`](./PROJECT_FLOW.md).
+Read the full engineering story in [`projectflow.md`](./projectflow.md).
 
 ---
 
@@ -107,17 +107,22 @@ Read the full engineering story in [`PROJECT_FLOW.md`](./PROJECT_FLOW.md).
 
 ```
 papeer/
-├── backend/
+├── Backend/
 │   ├── __init__.py
-│   ├── models.py         # Pydantic schemas / data models
-│   ├── paper_loader.py    # Document ingestion & chunking
-│   ├── vector_store.py    # Embeddings + Qdrant vector DB logic
-│   ├── rag_graph.py        # LangGraph orchestration
-│   └── btw_handler.py      # LLM handler layer
-├── about_project.md        # Original design spec
-├── PROJECT_FLOW.md         # Full engineering build log
+│   ├── config.py          # Central config (embedding dim, etc.)
+│   ├── models.py          # Pydantic schemas for all LLM structured outputs
+│   ├── paper_loader.py    # Document ingestion (PDF, TXT, MD, URL, arXiv)
+│   ├── embedding_factory.py # Pluggable embedding model factory
+│   ├── llm_factory.py     # Pluggable LLM factory + Gemini 429 retry proxy
+│   ├── vector_store.py    # Qdrant vector store + hybrid retrieval
+│   ├── rag_graph.py       # LangGraph agentic pipeline orchestration
+│   └── btw_handler.py     # /btw private side-channel handler
+├── Documents/             # Sample research papers
+├── about_project.md       # Original design spec
+├── projectflow.md         # Full engineering build narrative
+├── graph.png              # Current LangGraph pipeline visualisation
 ├── requirements.txt
-├── .env.example
+├── .env                   # API keys and config (never committed)
 ├── .gitignore
 └── README.md
 ```
@@ -141,11 +146,31 @@ pip install -r requirements.txt
 > Using Windows/Linux? Activate with `venv\Scripts\activate` (Windows) or `source venv/bin/activate` (Linux).
 
 ### 3. Configure environment variables
-Create a `.env` file in the root directory:
+Create a `.env` file in the root directory with the following keys:
 ```env
-QDRANT_URL=your_qdrant_url
+# ── Required ──────────────────────────────────────────────────────────────
+GEMINI_API_KEY=your_gemini_api_key          # Google AI Studio → https://aistudio.google.com
+TAVILY_API_KEY=your_tavily_api_key          # https://tavily.com
+
+QDRANT_URL=your_qdrant_cluster_url          # https://cloud.qdrant.io
 QDRANT_API_KEY=your_qdrant_api_key
-HUGGINGFACEHUB_API_TOKEN=your_hf_token
+
+# ── Embeddings ────────────────────────────────────────────────────────────
+EMBEDDING_PROVIDER=huggingface              # huggingface | ollama | openai
+HF_EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
+
+# ── LLM routing ───────────────────────────────────────────────────────────
+LLM_PROVIDER=gemini                         # gemini | ollama | vllm | openai | groq
+MODEL_ROUTING_MODE=dynamic                  # dynamic | gemini | openweight
+GEMINI_MODEL=gemini-3.6-flash
+
+# ── Open-weight model (local / GPU) ───────────────────────────────────────
+OPENWEIGHT_PROVIDER=ollama                  # ollama | vllm
+OLLAMA_MODEL=qwen2.5:3b
+OLLAMA_BASE_URL=http://localhost:11434
+
+# ── Optional: Groq fallback for open-weight ───────────────────────────────
+# GROQ_API_KEY=your_groq_api_key
 ```
 
 ### 4. Pull the local LLM (for development)
@@ -183,7 +208,7 @@ The retrieval and generation pipeline is quantitatively benchmarked using **RAGA
 - [ ] CI pipeline (lint + test on push)
 - [ ] Public hosted demo
 
-See [`PROJECT_FLOW.md`](./PROJECT_FLOW.md) for the full build narrative, including the debugging story behind each of these decisions.
+See [`projectflow.md`](./projectflow.md) for the full build narrative, including the debugging story behind each of these decisions.
 
 ---
 

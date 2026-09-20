@@ -1,4 +1,4 @@
- # 🚀 Agentic RAG Chatbot
+# 🚀 Agentic RAG Chatbot
 
 ### Intelligent Retrieval • Memory-Aware Conversations • Research Verification • Production-Oriented Architecture
 
@@ -181,7 +181,7 @@ Answer         │
                ▼
          Retrieve Again
                │
-          Maximum 2 Attempts
+          Maximum 3 Attempts
                │
                ▼
       Still Not Relevant?
@@ -206,7 +206,7 @@ Every retrieved document is evaluated before answer generation.
 
 * Automatically rewrite the query
 * Retry retrieval
-* Maximum of **2 retrieval attempts**
+* Maximum of **3 retrieval attempts**
 
 If high-quality evidence still cannot be found, the chatbot safely returns:
 
