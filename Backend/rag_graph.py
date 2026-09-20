@@ -1,4 +1,48 @@
+"""
+Backend/rag_graph.py
+---------------------
+LangGraph orchestration — the core agentic RAG pipeline.
+
+Graph overview
+~~~~~~~~~~~~~~
+Every user message enters the pipeline at the *router* node, which classifies
+the query into an intent route and selects the appropriate model tier.  The
+graph then branches into one of three paths:
+
+  retrieve path:
+    router → agent_node ↔ retrieval (tool calls) → relevancy_check
+          → [query_rewrite → agent_node]* → generate_answer
+
+  verify_claim path:
+    router → verify_claim → generate_answer
+
+  direct_answer path:
+    router → generate_answer
+
+Node responsibilities
+~~~~~~~~~~~~~~~~~~~~~
+  router_node          — dual intent + model-tier classification
+  agent_node           — runs the retrieval agent (decides which tools to call)
+  retrieval            — ToolNode that executes retrieve_from_vectorstore / web_search
+  relevancy_check_node — judges whether retrieved chunks are good enough to answer
+  query_rewrite_node   — rewrites the query when retrieval quality is poor (max 1 retry)
+  verify_claim_node    — web + arXiv search to check if a claim is still valid
+  generate_answer_node — synthesises the final answer using the routed LLM tier
+
+State
+~~~~~
+RAGState extends MessagesState (LangGraph's built-in message list) with
+domain-specific fields tracked across the graph run.
+
+Persistence
+~~~~~~~~~~~
+Graph state is persisted to a SQLite database (checkpoints.db) via LangGraph's
+SqliteSaver.  Each chat session maps to a unique thread_id so conversations are
+fully independent and survive server restarts.
+"""
+
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -9,10 +53,9 @@ warnings.filterwarnings("ignore", message="The default value of `allowed_objects
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import InjectedToolCallId, tool
-from Backend.llm_factory import get_llm
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.prebuilt import InjectedState, ToolNode, tools_condition
@@ -20,157 +63,116 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
-from Backend.models import ClaimVerificationResult, RelevancyDecision, RouterDecision
+from Backend.llm_factory import get_frontier_llm, get_llm_by_tier, get_openweight_llm
+from Backend.models import ClaimVerificationResult, DualRouterDecision
 from Backend.vector_store import search as vs_search
 
 load_dotenv(override=True)
+logger = logging.getLogger(__name__)
 
 
+# ── LLM singletons ────────────────────────────────────────────────────────────
+# Module-level singletons avoid re-instantiating (and re-authenticating)
+# models on every request.
 
-llm = get_llm()
+frontier_llm = get_frontier_llm()
+
+try:
+    openweight_llm = get_openweight_llm()
+except Exception as exc:
+    # Open-weight backend unavailable (Ollama not running, no GPU).
+    # Fall back to frontier so the graph still works.
+    logger.warning(
+        "Could not initialise open-weight LLM (%s). Defaulting to frontier LLM.", exc
+    )
+    openweight_llm = frontier_llm
+
+# Alias: `llm` is the model used for graph-internal operations
+# (router, relevancy check, query rewrite).  Always uses the frontier model
+# for consistency, regardless of the per-query model-tier decision.
+llm = frontier_llm
 
 
-
-# ── State ─────────────────────────────────────────────────────────────────────
+# ── Graph state ───────────────────────────────────────────────────────────────
 
 class RAGState(MessagesState):
-    session_id: str
-    query: str
-    route: str | None
-    retrieved_docs: list[Document]
-    retrieval_attempts: int
-    claim_verdict: str | None
-    claim_source: str | None
-    superseding_papers: list[dict] | None
-    answer: str | None
-    is_relevant: bool | None
-    rewrite_count: int
+    """Full state carried through the LangGraph pipeline.
+
+    Inherits the `messages` list from MessagesState.  All other fields
+    are RAG-specific and are reset / updated by individual nodes.
+
+    Fields:
+        session_id          Unique chat session identifier (maps to a Qdrant collection).
+        query               The user's original query text (preserved across rewrites).
+        route               Intent route set by the router: 'retrieve' | 'verify_claim' | 'direct_answer'.
+        selected_model      Model tier chosen by the router: 'gemini' | 'qwen'.
+        model_route_reason  One-sentence rationale for the model-tier decision (shown in UI).
+        retrieved_docs      Documents accumulated by the retrieval agent across tool calls.
+        retrieval_attempts  Number of times the retrieval agent has called a tool.
+        claim_verdict       Verdict summary from the claim-verification node.
+        claim_source        URL of the first superseding paper (if any).
+        superseding_papers  List of dicts describing papers that supersede the claim.
+        answer              Final generated answer text.
+        is_relevant         Whether retrieved docs passed the relevancy gate (None = not yet checked).
+        rewrite_count       Number of query rewrites performed (capped at 1).
+    """
+
+    session_id:          str
+    query:               str
+    route:               str | None
+    selected_model:      str | None
+    model_route_reason:  str | None
+    retrieved_docs:      list[Document]
+    retrieval_attempts:  int
+    claim_verdict:       str | None
+    claim_source:        str | None
+    superseding_papers:  list[dict] | None
+    answer:              str | None
+    is_relevant:         bool | None
+    rewrite_count:       int
 
 
-# ── Router ────────────────────────────────────────────────────────────────────
+# ── Prompt constants ──────────────────────────────────────────────────────────
+# All prompts live here so they can be reviewed, tuned, or unit-tested without
+# digging through node functions.
 
-ROUTER_PROMPT = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        "You are a routing assistant for a research paper Q&A system.\n"
-        "Classify the user query into exactly one category: 'retrieve', 'verify_claim', or 'direct_answer'.\n"
-        "- retrieve: Questions about research papers, documents, or live data.\n"
-        "- verify_claim: Checking if a claim is superseded by newer work.\n"
-        "- direct_answer: Pure general knowledge questions.\n"
-        "When in doubt, choose 'retrieve'.\n"
-        "Return ONLY a JSON object: {{\"route\": \"retrieve\"}} or {{\"route\": \"verify_claim\"}} or {{\"route\": \"direct_answer\"}}."
-    ),
-    ("human", "{query}"),
-])
-
-router_chain = ROUTER_PROMPT | llm
-
-
-def router_node(state: RAGState) -> dict:
-    query = state["messages"][-1].content
-    try:
-        response = router_chain.invoke({"query": query})
-        content = str(response.content if hasattr(response, "content") else response).strip()
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        if match:
-            data = json.loads(match.group(0))
-            route = data.get("route", "retrieve")
-            if route in ("retrieve", "verify_claim", "direct_answer"):
-                return {"route": route}
-        if "verify" in content.lower():
-            return {"route": "verify_claim"}
-        if "direct" in content.lower():
-            return {"route": "direct_answer"}
-        return {"route": "retrieve"}
-    except Exception:
-        return {"route": "retrieve"}
-
-
-# ── Tool schemas ──────────────────────────────────────────────────────────────
-
-class RetrieverInput(BaseModel):
-    query: str = Field(description="Semantic query to search research paper chunks")
-    k: int = Field(default=4, ge=1, le=10, description="Number of chunks to retrieve")
-
-
-class WebSearchInput(BaseModel):
-    optimized_query: str = Field(description="Query rewritten and optimized for web search")
-    max_results: int = Field(default=3, ge=1, le=10, description="Number of web results to return")
-
-
-# ── Tools ─────────────────────────────────────────────────────────────────────
-
-@tool(args_schema=RetrieverInput)
-def retrieve_from_vectorstore(
-    query: str,
-    k: int,
-    session_id: Annotated[str, InjectedState("session_id")],
-    current_docs: Annotated[list, InjectedState("retrieved_docs")],
-    tool_call_id: Annotated[str, InjectedToolCallId],
-) -> list:
-    """Search the uploaded research paper vector store for relevant passages."""
-    docs = vs_search(query=query, session_id=session_id, k=k)
-    if not docs:
-        return [ToolMessage(content="No relevant documents found in the vector store.", tool_call_id=tool_call_id)]
-    summary = f"Retrieved {len(docs)} chunk(s) from the vector store."
-    return [
-        ToolMessage(content=summary, tool_call_id=tool_call_id),
-        Command(update={"retrieved_docs": (current_docs or []) + docs}),
-    ]
-
-
-@tool(args_schema=WebSearchInput)
-def web_search(
-    optimized_query: str,
-    max_results: int,
-    current_docs: Annotated[list, InjectedState("retrieved_docs")],
-    tool_call_id: Annotated[str, InjectedToolCallId],
-) -> list:
-    """Search the web for current or supplementary information using Tavily."""
-    client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
-    results = client.search(optimized_query, max_results=max_results)
-    if not results.get("results"):
-        return [ToolMessage(content="No web results found.", tool_call_id=tool_call_id)]
-    web_docs = [
-        Document(
-            page_content=r["content"],
-            metadata={"url": r["url"], "title": r.get("title", "Web Result")},
-        )
-        for r in results["results"]
-    ]
-    summary = f"Found {len(web_docs)} web result(s) for: {optimized_query}"
-    return [
-        ToolMessage(content=summary, tool_call_id=tool_call_id),
-        Command(update={"retrieved_docs": (current_docs or []) + web_docs}),
-    ]
-
-
-# ── Retrieval agent singletons ────────────────────────────────────────────────
-
-RETRIEVAL_TOOLS = [retrieve_from_vectorstore, web_search]
-if type(llm).__name__ == "ChatOpenAI":
-    retrieval_llm = llm.bind_tools(RETRIEVAL_TOOLS, parallel_tool_calls=False)
-else:
-    retrieval_llm = llm.bind_tools(RETRIEVAL_TOOLS)
-base_tool_node = ToolNode(RETRIEVAL_TOOLS)
-
-RETRIEVE_SYSTEM = (
-    "You are a research assistant gathering context to answer a user's question about research papers.\n\n"
-    "You have two tools available and full control over how you use them:\n\n"
-    "1. retrieve_from_vectorstore — searches the uploaded paper collection.\n"
-    "   You decide:\n"
-    "   - query: the semantic search query (phrase it to best match relevant paper chunks)\n"
-    "   - k: how many chunks to retrieve (1–10; use more for broad questions, fewer for specific ones)\n\n"
-    "2. web_search — searches the live web via Tavily.\n"
-    "   You decide:\n"
-    "   - optimized_query: rewrite the user's question as a concise, keyword-rich web search query\n"
-    "   - max_results: how many results to fetch (1–10)\n\n"
-    "Choose the right source based on the question:\n"
-    "- Questions about the uploaded papers → use retrieve_from_vectorstore\n"
-    "Do NOT produce a final answer. Only call tools to collect context."
+# Router system prompt — guides the LLM to classify intent and model tier
+ROUTER_SYSTEM_PROMPT = (
+    "You are an intelligent dual router for a research paper RAG system.\n"
+    "Analyse the user's query and classify it into:\n\n"
+    "1. route:\n"
+    "   - 'retrieve': Questions about research papers, methods, architectures, "
+    "benchmark numbers, or live data.\n"
+    "   - 'verify_claim': Checking if a specific scientific claim/result is "
+    "superseded or updated by newer literature.\n"
+    "   - 'direct_answer': Pure conversational greetings, general knowledge, "
+    "or basic non-paper questions.\n\n"
+    "2. model_tier:\n"
+    "   - 'gemini' (Frontier API): For multi-paper comparative synthesis, "
+    "theoretical derivations, complex algorithmic trade-offs, deep cross-domain "
+    "reasoning, or ambiguous questions.\n"
+    "   - 'qwen' (Open-weight GPU): For specific factual lookups, single-paper "
+    "section queries, parameter/metric extraction, keyword definitions, or "
+    "straightforward summaries.\n\n"
+    "3. reason: concise 1-sentence rationale."
 )
 
-QUERY_REWRITE_SYSTEM = (
+# Retrieval agent system prompt — instructs the agent on tool selection
+RETRIEVE_SYSTEM_PROMPT = (
+    "You are a research assistant gathering context to answer a user's question "
+    "about research papers.\n\n"
+    "You have two tools available:\n\n"
+    "1. retrieve_from_vectorstore — searches the uploaded paper collection.\n"
+    "   Choose the query carefully to match relevant paper chunks; set k to the "
+    "number of chunks needed (1–10).\n\n"
+    "2. web_search — searches the live web via Tavily.\n"
+    "   Rewrite the user's question as a concise, keyword-rich web query.\n\n"
+    "For questions about uploaded papers, always use retrieve_from_vectorstore.\n"
+    "Do NOT produce a final answer — only call tools to collect context."
+)
+
+# Query rewrite system prompt — asks for a better search query after failure
+QUERY_REWRITE_SYSTEM_PROMPT = (
     "You are a query rewriting assistant for a research paper retrieval system. "
     "The previous query failed to retrieve relevant document chunks. "
     "Rewrite the query using more specific or alternative terminology, "
@@ -178,107 +180,317 @@ QUERY_REWRITE_SYSTEM = (
     "Return ONLY the rewritten query as plain text. No explanation, no preamble."
 )
 
+# Claim analysis prompt — used inside verify_claim_node
+CLAIM_ANALYSIS_PROMPT = (
+    "You are a research fact-checker. Given a claim from a research paper and "
+    "a set of recent web and arXiv search results, determine:\n"
+    "1. Has this claim been superseded, significantly challenged, or updated by "
+    "more recent work?\n"
+    "2. Identify up to 3 papers from the provided results that supersede or update "
+    "the claim.\n\n"
+    "Rules:\n"
+    "- Use ONLY titles and URLs that appear verbatim in the provided search results.\n"
+    "- Prefer arXiv paper links (arxiv.org) over general web links when available.\n"
+    "- For each superseding paper, write one sentence explaining how it supersedes "
+    "the claim.\n"
+    "- If the claim still holds, set is_superseded=false and return an empty "
+    "superseding_papers list.\n"
+    "- verdict_summary should be 1-2 sentences suitable for display to the user."
+)
 
-# ── Nodes ─────────────────────────────────────────────────────────────────────
-
-def agent_node(state: RAGState) -> dict:
-    current_attempts = state.get("retrieval_attempts", 0)
-    if current_attempts >= MAX_RETRIEVAL_ATTEMPTS:
-        return {}
-    messages = [{"role": "system", "content": RETRIEVE_SYSTEM}] + state["messages"]
-    response = retrieval_llm.invoke(messages)
-    updates: dict = {"messages": [response]}
-    if getattr(response, "tool_calls", None):
-        updates["retrieval_attempts"] = current_attempts + 1
-    return updates
-
-
-# ── Relevancy check ───────────────────────────────────────────────────────────
-
+# Relevancy check prompt template
 RELEVANCY_CHECK_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
         "You evaluate whether retrieved document chunks contain relevant information "
         "to answer the user's question about research papers.\n"
-        "Be lenient: if there is any substantive overlap or relevant context, mark is_relevant as 'yes'.\n"
-        "Return ONLY a JSON object: {{\"is_relevant\": \"yes\", \"reason\": \"...\"}} or {{\"is_relevant\": \"no\", \"reason\": \"...\"}}."
+        "Be lenient: if there is any substantive overlap or relevant context, "
+        "mark is_relevant as 'yes'.\n"
+        "Return ONLY a JSON object with keys 'is_relevant' (yes/no) and 'reason'."
     ),
     ("human", "Question: {query}\n\nRetrieved Chunks:\n{chunks}\n\nJSON decision:"),
 ])
 
-relevancy_chain = RELEVANCY_CHECK_PROMPT | llm
+
+# ── Pipeline constants ─────────────────────────────────────────────────────────
+
+# Maximum number of tool-call rounds the retrieval agent may perform per query
+MAX_RETRIEVAL_ATTEMPTS = 3
+
+
+# ── Tool input schemas ────────────────────────────────────────────────────────
+
+class RetrieverInput(BaseModel):
+    """Input schema for the vector-store retrieval tool."""
+    query: str  = Field(description="Semantic query to search research paper chunks.")
+    k:     int  = Field(default=4, ge=1, le=10, description="Number of chunks to retrieve.")
+
+
+class WebSearchInput(BaseModel):
+    """Input schema for the web search tool."""
+    optimized_query: str = Field(description="Query rewritten and optimised for web search.")
+    max_results:     int = Field(default=3, ge=1, le=10, description="Number of web results.")
+
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
+
+@tool(args_schema=RetrieverInput)
+def retrieve_from_vectorstore(
+    query:        str,
+    k:            int,
+    session_id:   Annotated[str,  InjectedState("session_id")],
+    current_docs: Annotated[list, InjectedState("retrieved_docs")],
+    tool_call_id: Annotated[str,  InjectedToolCallId],
+) -> list:
+    """Search the uploaded research paper vector store for relevant passages.
+
+    Appends results to the accumulated retrieved_docs list in state so multiple
+    tool calls within the same agent turn build up context incrementally.
+    """
+    try:
+        docs = vs_search(query=query, session_id=session_id, k=k)
+    except Exception as exc:
+        logger.warning("Vector search failed (%s). Returning empty result.", exc)
+        docs = []
+
+    if not docs:
+        return [ToolMessage(
+            content="No relevant documents found in the vector store.",
+            tool_call_id=tool_call_id,
+        )]
+
+    return [
+        ToolMessage(
+            content=f"Retrieved {len(docs)} chunk(s) from the vector store.",
+            tool_call_id=tool_call_id,
+        ),
+        Command(update={"retrieved_docs": (current_docs or []) + docs}),
+    ]
+
+
+@tool(args_schema=WebSearchInput)
+def web_search(
+    optimized_query: str,
+    max_results:     int,
+    current_docs:    Annotated[list, InjectedState("retrieved_docs")],
+    tool_call_id:    Annotated[str,  InjectedToolCallId],
+) -> list:
+    """Search the live web using Tavily and append results as Documents.
+
+    Used when the query requires information not present in the uploaded papers,
+    or when the router determines a web search is needed.
+    """
+    client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+    results = client.search(optimized_query, max_results=max_results)
+
+    if not results.get("results"):
+        return [ToolMessage(content="No web results found.", tool_call_id=tool_call_id)]
+
+    web_docs = [
+        Document(
+            page_content=r["content"],
+            metadata={"url": r["url"], "title": r.get("title", "Web Result")},
+        )
+        for r in results["results"]
+    ]
+    return [
+        ToolMessage(
+            content=f"Found {len(web_docs)} web result(s) for: {optimized_query}",
+            tool_call_id=tool_call_id,
+        ),
+        Command(update={"retrieved_docs": (current_docs or []) + web_docs}),
+    ]
+
+
+# ── Retrieval agent setup ─────────────────────────────────────────────────────
+# The retrieval agent is the frontier LLM bound to the tools above.  It decides
+# autonomously which tool(s) to call and with what arguments.
+
+RETRIEVAL_TOOLS = [retrieve_from_vectorstore, web_search]
+
+# Gemini does not support parallel tool calls in all versions; disable them
+# for OpenAI-compatible backends to avoid "multiple tool calls" errors.
+if type(llm).__name__ == "ChatOpenAI":
+    retrieval_llm = llm.bind_tools(RETRIEVAL_TOOLS, parallel_tool_calls=False)
+else:
+    retrieval_llm = llm.bind_tools(RETRIEVAL_TOOLS)
+
+base_tool_node = ToolNode(RETRIEVAL_TOOLS)
+
+# Structured-output chains used by router and verification nodes
+router_structured_llm  = frontier_llm.with_structured_output(DualRouterDecision)
+verification_llm       = llm.with_structured_output(ClaimVerificationResult)
+relevancy_chain        = RELEVANCY_CHECK_PROMPT | llm
+
+
+# ── Graph nodes ───────────────────────────────────────────────────────────────
+
+def router_node(state: RAGState) -> dict:
+    """Classify the query and select the model tier.
+
+    Calls the Frontier LLM with a structured output schema to produce a
+    DualRouterDecision containing:
+      - route       : where to send the query
+      - model_tier  : which LLM tier to use for the final answer
+      - reason      : human-readable rationale shown in the UI
+
+    Falls back to a lightweight heuristic classifier if the LLM call fails.
+    Respects MODEL_ROUTING_MODE env var for manual override.
+    """
+    query = state["messages"][-1].content
+    mode  = os.getenv("MODEL_ROUTING_MODE", "dynamic").strip().lower()
+
+    # Sensible defaults used if both LLM call and heuristics fail
+    route      = "retrieve"
+    model_tier = "qwen"
+    reason     = "Factual research retrieval routed to Open-Weight Qwen on GPU."
+
+    try:
+        decision: DualRouterDecision = router_structured_llm.invoke([
+            SystemMessage(content=ROUTER_SYSTEM_PROMPT),
+            HumanMessage(content=query),
+        ])
+        route      = decision.route
+        model_tier = decision.model_tier
+        reason     = decision.reason
+
+    except Exception as exc:
+        # LLM call failed — apply keyword heuristics as a fallback
+        logger.warning("Router LLM failed (%s). Applying heuristic fallback.", exc)
+        q = query.lower()
+
+        if any(t in q for t in ["verify", "is it true", "superseded", "still valid"]):
+            route, model_tier = "verify_claim", "gemini"
+            reason = "Scientific claim verification dispatched to Gemini Frontier."
+        elif any(t in q for t in ["compare", "contrast", "trade-off", "tradeoff",
+                                   "derive", "synthesize", "explain the difference"]):
+            route, model_tier = "retrieve", "gemini"
+            reason = "Complex multi-paper synthesis dispatched to Gemini Frontier."
+        elif len(query.split()) < 4 and any(g in q for g in ["hi", "hello", "hey", "who are you"]):
+            route, model_tier = "direct_answer", "qwen"
+            reason = "Conversational greeting handled by Open-Weight Qwen."
+
+    # Manual override — env var wins over LLM routing decision
+    if mode == "gemini":
+        model_tier = "gemini"
+        reason     = "Manual override: forced Frontier Gemini tier."
+    elif mode in ("openweight", "qwen"):
+        model_tier = "qwen"
+        reason     = "Manual override: forced Open-Weight Qwen tier."
+
+    return {
+        "route":              route,
+        "selected_model":     model_tier,
+        "model_route_reason": reason,
+    }
+
+
+def agent_node(state: RAGState) -> dict:
+    """Run one round of the retrieval agent.
+
+    Invokes the retrieval LLM with the current message history and the
+    RETRIEVE_SYSTEM_PROMPT.  If the model returns tool calls, those are
+    executed by the downstream 'retrieval' ToolNode and the count is
+    incremented.  Once MAX_RETRIEVAL_ATTEMPTS is reached, this node returns
+    an empty dict to let the graph route to relevancy_check / generate_answer.
+    """
+    if state.get("retrieval_attempts", 0) >= MAX_RETRIEVAL_ATTEMPTS:
+        return {}
+
+    messages  = [{"role": "system", "content": RETRIEVE_SYSTEM_PROMPT}] + state["messages"]
+    response  = retrieval_llm.invoke(messages)
+    updates: dict = {"messages": [response]}
+
+    if getattr(response, "tool_calls", None):
+        updates["retrieval_attempts"] = state.get("retrieval_attempts", 0) + 1
+
+    return updates
 
 
 def relevancy_check_node(state: RAGState) -> dict:
-    query = state["query"]
-    docs = state.get("retrieved_docs") or []
+    """Judge whether retrieved document chunks are relevant to the query.
+
+    Uses the frontier LLM to assess the top-3 retrieved chunks against the
+    query and returns a boolean `is_relevant` value.  Defaults to True if the
+    LLM call fails so retrieval errors do not silently block answer generation.
+    """
+    query        = state["query"]
+    docs         = state.get("retrieved_docs") or []
     doc_snippets = "\n\n---\n\n".join(doc.page_content for doc in docs[:3])
+
     if not doc_snippets:
         return {"is_relevant": False}
+
     try:
         response = relevancy_chain.invoke({"query": query, "chunks": doc_snippets})
-        content = str(response.content if hasattr(response, "content") else response).strip()
-        match = re.search(r'\{.*\}', content, re.DOTALL)
+        content  = str(
+            response.content if hasattr(response, "content") else response
+        ).strip()
+
+        # Parse the JSON decision from the LLM response
+        match = re.search(r"\{.*\}", content, re.DOTALL)
         if match:
-            data = json.loads(match.group(0))
+            data   = json.loads(match.group(0))
             is_rel = str(data.get("is_relevant", "")).strip().lower() in ("yes", "true", "1")
             return {"is_relevant": is_rel}
+
+        # Fallback: plain-text heuristic
         return {"is_relevant": "yes" in content.lower() or "true" in content.lower()}
+
     except Exception:
+        # Default to relevant to avoid blocking the pipeline on errors
         return {"is_relevant": True}
 
 
 def query_rewrite_node(state: RAGState) -> dict:
-    original_query = state["query"]
-    rewrite_count = state.get("rewrite_count", 0)
+    """Rewrite the query when initial retrieval did not produce relevant results.
+
+    Calls the LLM with the QUERY_REWRITE_SYSTEM_PROMPT to generate a better
+    search query, then resets retrieval state so the agent tries again from
+    scratch with the new query.
+    """
     response = llm.invoke([
-        {"role": "system", "content": QUERY_REWRITE_SYSTEM},
-        {"role": "user", "content": f"Original query: {original_query}\n\nWrite an improved search query."},
+        {"role": "system",  "content": QUERY_REWRITE_SYSTEM_PROMPT},
+        {"role": "user",    "content": f"Original query: {state['query']}\n\nWrite an improved search query."},
     ])
     rewritten = response.content.strip()
+
     return {
-        "messages": [HumanMessage(content=rewritten)],
-        "query": rewritten,
-        "retrieved_docs": [],
+        "messages":           [HumanMessage(content=rewritten)],
+        "query":              rewritten,
+        "retrieved_docs":     [],
         "retrieval_attempts": 0,
-        "rewrite_count": rewrite_count + 1,
-        "is_relevant": None,
+        "rewrite_count":      state.get("rewrite_count", 0) + 1,
+        "is_relevant":        None,
     }
 
 
-CLAIM_ANALYSIS_PROMPT = (
-    "You are a research fact-checker. Given a claim from a research paper and "
-    "a set of recent web and arXiv search results, determine:\n"
-    "1. Has this claim been superseded, significantly challenged, or updated by more recent work?\n"
-    "2. Identify up to 3 papers from the provided results that supersede or update the claim.\n\n"
-    "Rules:\n"
-    "- Use ONLY titles and URLs that appear verbatim in the provided search results.\n"
-    "- Prefer arXiv paper links (arxiv.org) over general web links when available.\n"
-    "- For each superseding paper, write one sentence explaining how it supersedes the claim.\n"
-    "- If the claim still holds, set is_superseded=false and return an empty superseding_papers list.\n"
-    "- verdict_summary should be 1-2 sentences suitable for display to the user."
-)
-
-verification_llm = llm.with_structured_output(ClaimVerificationResult)
-
-
 def verify_claim_node(state: RAGState) -> dict:
-    claim = state["messages"][-1].content
-    tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+    """Check whether a research claim has been superseded by newer work.
 
-    # General web search for recent work superseding the claim
+    Performs two Tavily searches:
+      1. General web search for recent papers contradicting the claim.
+      2. arXiv-targeted search for academic papers on the same topic.
+
+    Results are passed to the verification LLM which returns a structured
+    ClaimVerificationResult with a verdict and up to 3 superseding papers.
+    """
+    claim          = state["messages"][-1].content
+    tavily_client  = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+
+    # Search 1: general web — broad coverage of recent challenges to the claim
     general_results = tavily_client.search(
         f"recent research superseding: {claim[:200]}",
         max_results=5,
     ).get("results", [])
 
-    # arXiv-targeted search via web to get paper titles and links
+    # Search 2: arXiv-targeted — higher chance of finding peer-reviewed papers
     arxiv_results = tavily_client.search(
         f"site:arxiv.org {claim[:200]}",
         max_results=5,
     ).get("results", [])
 
-    # Build context block
+    # Build a structured context block for the verification LLM
     lines = ["=== General Web Search Results ==="]
     for r in general_results:
         lines.append(
@@ -286,7 +498,6 @@ def verify_claim_node(state: RAGState) -> dict:
             f"URL: {r['url']}\n"
             f"Snippet: {r.get('content', '')[:300]}\n"
         )
-
     lines.append("=== arXiv Paper Search Results ===")
     for r in arxiv_results:
         lines.append(
@@ -295,55 +506,94 @@ def verify_claim_node(state: RAGState) -> dict:
             f"Snippet: {r.get('content', '')[:300]}\n"
         )
 
-    context = "\n".join(lines)
-
     prompt = (
         f"{CLAIM_ANALYSIS_PROMPT}\n\n"
         f"Claim to verify:\n{claim}\n\n"
-        f"Search Results:\n{context}"
+        f"Search Results:\n{chr(10).join(lines)}"
     )
+
     result: ClaimVerificationResult = verification_llm.invoke([
         {"role": "user", "content": prompt}
     ])
 
     papers_dicts = [p.model_dump() for p in result.superseding_papers[:3]]
     return {
-        "claim_verdict": result.verdict_summary,
-        "claim_source": papers_dicts[0]["url"] if papers_dicts else None,
+        "claim_verdict":      result.verdict_summary,
+        "claim_source":       papers_dicts[0]["url"] if papers_dicts else None,
         "superseding_papers": papers_dicts,
     }
 
 
 def generate_answer_node(state: RAGState) -> dict:
-    route = state.get("route")
-    query = state["query"]
+    """Synthesise the final answer using the routed LLM tier.
 
+    Handles three answer paths based on the intent route in state:
+
+    'retrieve':
+        Uses retrieved document context as a system prompt prefix.
+        Falls back to frontier LLM if the selected tier fails.
+        Returns a graceful "no relevant info" message if retrieval failed.
+
+    'verify_claim':
+        Formats the claim verdict and superseding papers into a structured
+        markdown response without calling the LLM again.
+
+    'direct_answer':
+        Uses only conversation history — no retrieval context.
+        Falls back to frontier LLM if the selected tier fails.
+    """
+    route         = state.get("route")
+    selected_tier = state.get("selected_model") or "gemini"
+
+    # Resolve the tier string to an actual LLM instance
+    try:
+        active_llm = get_llm_by_tier(selected_tier)
+    except Exception as exc:
+        logger.warning(
+            "Could not load tier '%s' (%s). Falling back to frontier LLM.", selected_tier, exc
+        )
+        active_llm = frontier_llm
+
+    # ── Path 1: Document retrieval answer ─────────────────────────────────
     if route == "retrieve":
+        # Retrieval exhausted with no relevant results — return graceful fallback
         if state.get("is_relevant") is False and state.get("rewrite_count", 0) >= 1:
             answer = (
                 "I wasn't able to find relevant information in the uploaded papers "
-                "to answer your question. You may want to rephrase your question "
-                "or upload additional papers."
+                "to answer your question. Try rephrasing your question or uploading "
+                "additional papers."
             )
+
         else:
             docs = state.get("retrieved_docs") or []
             if not docs:
-                answer = "I don't know the answer based on the provided documents."
+                answer = "I don't have enough information in the provided documents to answer this."
             else:
-                selected_docs = docs[:3]
-                context = "\n\n---\n\n".join(doc.page_content[:1500] for doc in selected_docs)
-                system_content = (
-                    "You are a helpful research assistant. Answer the user's question concisely using the retrieved document context and conversation history.\n\n"
-                    f"Retrieved Context:\n{context}"
+                # Use top-3 parent chunks as context (each capped at 1500 chars)
+                context = "\n\n---\n\n".join(doc.page_content[:1500] for doc in docs[:3])
+                system_message = SystemMessage(
+                    content=(
+                        "You are a helpful research assistant. Answer the user's question "
+                        "concisely using the retrieved document context and conversation history.\n\n"
+                        f"Retrieved Context:\n{context}"
+                    )
                 )
-                system_message = SystemMessage(content=system_content)
                 messages = [system_message] + state["messages"]
-                answer = llm.invoke(messages).content
+                try:
+                    answer = active_llm.invoke(messages).content
+                except Exception as exc:
+                    logger.warning(
+                        "Tier '%s' failed during generation (%s). Falling back to frontier.",
+                        selected_tier, exc,
+                    )
+                    answer = frontier_llm.invoke(messages).content
 
+    # ── Path 2: Claim verification answer (pre-formatted, no LLM call) ────
     elif route == "verify_claim":
-        verdict = state.get("claim_verdict", "")
-        papers = state.get("superseding_papers") or []
+        verdict    = state.get("claim_verdict", "")
+        papers     = state.get("superseding_papers") or []
         claim_text = state["query"]
+
         if papers:
             papers_block = "\n\n".join(
                 f"{i + 1}. **{p['title']}**\n   {p['summary']}\n   Link: {p['url']}"
@@ -366,30 +616,59 @@ def generate_answer_node(state: RAGState) -> dict:
                 f"*No papers directly superseding this claim were found in recent literature.*"
             )
 
-    else:  # direct_answer
-        system_message = SystemMessage(content="You are a helpful research assistant. Answer the user's question using the conversation history and your knowledge.")
-        messages = [system_message] + state["messages"]
-        answer = llm.invoke(messages).content
+    # ── Path 3: Direct answer (general knowledge) ─────────────────────────
+    else:
+        messages = [
+            SystemMessage(
+                content="You are a helpful research assistant. Answer the user's question "
+                        "using the conversation history and your knowledge."
+            )
+        ] + state["messages"]
+        try:
+            answer = active_llm.invoke(messages).content
+        except Exception as exc:
+            logger.warning(
+                "Tier '%s' failed during generation (%s). Falling back to frontier.",
+                selected_tier, exc,
+            )
+            answer = frontier_llm.invoke(messages).content
 
+    # ── Normalise answer to a plain string ─────────────────────────────────
+    # Some models return a list of content parts instead of a string.
+    if isinstance(answer, list):
+        answer = "".join(
+            item["text"] if isinstance(item, dict) and "text" in item else str(item)
+            for item in answer
+        )
+
+    # Strip any <think>...</think> blocks emitted by chain-of-thought models
     clean_answer = re.sub(r"<think>[\s\S]*?</think>", "", str(answer)).strip()
-    return {"answer": clean_answer, "messages": [AIMessage(content=clean_answer)]}
+
+    return {
+        "answer":   clean_answer,
+        "messages": [AIMessage(content=clean_answer)],
+    }
 
 
-# ── Graph ─────────────────────────────────────────────────────────────────────
-
-MAX_RETRIEVAL_ATTEMPTS = 3
-
+# ── Routing functions ─────────────────────────────────────────────────────────
+# These are pure functions that read state and return a string edge label.
+# They contain no LLM calls.
 
 def route_query(state: RAGState) -> str:
+    """Edge function: branch on the intent route set by router_node."""
     return state["route"]
 
 
 def agent_routing(state: RAGState) -> str:
-    # Always execute pending tool calls first — shortcutting here would leave
-    # an AIMessage with tool_calls unmatched by ToolMessages in the checkpointer,
-    # corrupting history for all future turns in the same session.
-    tc = tools_condition(state)
-    if tc == "tools":
+    """Edge function: decide what follows after agent_node runs.
+
+    Priority order:
+      1. If there are pending tool calls → execute them ('retrieval')
+      2. If retrieval attempts are exhausted → skip check and generate answer
+      3. Otherwise → run the relevancy gate
+    """
+    if tools_condition(state) == "tools":
+        # Always honour pending tool calls to keep the message history consistent
         return "retrieval"
     if state.get("retrieval_attempts", 0) >= MAX_RETRIEVAL_ATTEMPTS:
         return "generate_answer"
@@ -397,6 +676,12 @@ def agent_routing(state: RAGState) -> str:
 
 
 def after_relevancy_routing(state: RAGState) -> str:
+    """Edge function: decide what follows after relevancy_check_node.
+
+    - Relevant docs → generate the answer
+    - Irrelevant + rewrite budget remaining → rewrite the query and retry
+    - Irrelevant + no budget → generate a graceful fallback answer
+    """
     if state.get("is_relevant", False):
         return "generate_answer"
     if state.get("rewrite_count", 0) < 1:
@@ -404,50 +689,75 @@ def after_relevancy_routing(state: RAGState) -> str:
     return "generate_answer"
 
 
+# ── Graph construction ────────────────────────────────────────────────────────
+
 def build_graph(db_path: str = "checkpoints.db"):
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    """Build, compile, and return the LangGraph RAG pipeline.
+
+    Creates a SQLite-backed checkpointer so conversation state persists across
+    server restarts.  Each thread_id (= session_id) has isolated state.
+
+    Args:
+        db_path: Path to the SQLite database file for checkpointing.
+
+    Returns:
+        A compiled LangGraph StateGraph ready to call `.stream()` or `.invoke()` on.
+    """
+    conn        = sqlite3.connect(db_path, check_same_thread=False)
     checkpointer = SqliteSaver(conn)
 
     graph = StateGraph(RAGState)
-    graph.add_node("router", router_node)
-    graph.add_node("agent_node", agent_node)
-    graph.add_node("retrieval", base_tool_node)
+
+    # ── Register nodes ─────────────────────────────────────────────────────
+    graph.add_node("router",          router_node)
+    graph.add_node("agent_node",      agent_node)
+    graph.add_node("retrieval",       base_tool_node)
     graph.add_node("relevancy_check", relevancy_check_node)
-    graph.add_node("query_rewrite", query_rewrite_node)
-    graph.add_node("verify_claim", verify_claim_node)
+    graph.add_node("query_rewrite",   query_rewrite_node)
+    graph.add_node("verify_claim",    verify_claim_node)
     graph.add_node("generate_answer", generate_answer_node)
 
+    # ── Entry point ────────────────────────────────────────────────────────
     graph.set_entry_point("router")
 
+    # ── Edges ──────────────────────────────────────────────────────────────
+
+    # 1. Router → intent branch
     graph.add_conditional_edges(
         "router",
         route_query,
         {
-            "retrieve": "agent_node",
-            "verify_claim": "verify_claim",
+            "retrieve":      "agent_node",
+            "verify_claim":  "verify_claim",
             "direct_answer": "generate_answer",
         },
     )
 
+    # 2. Retrieval agent loop
     graph.add_conditional_edges(
         "agent_node",
         agent_routing,
         {
-            "retrieval": "retrieval",
+            "retrieval":       "retrieval",
             "relevancy_check": "relevancy_check",
             "generate_answer": "generate_answer",
         },
     )
-    graph.add_edge("retrieval", "agent_node")
+    graph.add_edge("retrieval", "agent_node")   # tool results feed back to agent
 
+    # 3. Relevancy gate → rewrite or generate
     graph.add_conditional_edges(
         "relevancy_check",
         after_relevancy_routing,
-        {"query_rewrite": "query_rewrite", "generate_answer": "generate_answer"},
+        {
+            "query_rewrite":   "query_rewrite",
+            "generate_answer": "generate_answer",
+        },
     )
-    graph.add_edge("query_rewrite", "agent_node")
+    graph.add_edge("query_rewrite", "agent_node")  # retry retrieval after rewrite
 
-    graph.add_edge("verify_claim", "generate_answer")
+    # 4. Claim verification → answer generation
+    graph.add_edge("verify_claim",    "generate_answer")
     graph.add_edge("generate_answer", END)
 
     return graph.compile(checkpointer=checkpointer)
