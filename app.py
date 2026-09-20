@@ -165,6 +165,7 @@ with st.sidebar:
         active_sid = new_sid
         st.rerun()
     st.caption(f"🤖 **Embedding:** `{base_model_name}` ({get_embedding_dimension()} dim)")
+    st.caption("🧭 **Router:** Frontier (`Gemini 3.6`) ⮂ Open-Weight (`Qwen GPU`)")
     st.divider()
     st.markdown("## 💬 Sessions")
 
@@ -306,6 +307,14 @@ for msg in st.session_state.chats.get(active_sid, []):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg["role"] == "assistant":
+            if msg.get("model_tier"):
+                tier_badge = (
+                    "💎 **Frontier API (Gemini 3.6 Flash)**"
+                    if msg["model_tier"] == "gemini"
+                    else "⚡ **Open-Weight GPU (Qwen / vLLM)**"
+                )
+                reason_str = f" — *{msg['model_reason']}*" if msg.get("model_reason") else ""
+                st.caption(f"{tier_badge}{reason_str}")
             with st.expander(f"📊 Graph state · turn {msg['turn']}", expanded=False):
                 st.json(msg["graph_state"])
 
@@ -354,6 +363,8 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
             "session_id": active_sid,
             "query": prompt,
             "route": None,
+            "selected_model": None,
+            "model_route_reason": None,
             "retrieved_docs": [],
             "retrieval_attempts": 0,
             "claim_verdict": None,
@@ -386,6 +397,17 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
             placeholder.markdown(response_text)
 
             final_values = graph.get_state(config).values
+            selected_tier = final_values.get("selected_model", "gemini")
+            tier_reason = final_values.get("model_route_reason", "")
+
+            tier_badge = (
+                "💎 **Frontier API (Gemini 3.6 Flash)**"
+                if selected_tier == "gemini"
+                else "⚡ **Open-Weight GPU (Qwen / vLLM)**"
+            )
+            reason_str = f" — *{tier_reason}*" if tier_reason else ""
+            st.caption(f"{tier_badge}{reason_str}")
+
             state_snapshot = _serialize_state(final_values)
 
             with st.expander(f"📊 Graph state · turn {current_turn}", expanded=False):
@@ -395,6 +417,8 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
             {
                 "role": "assistant",
                 "content": response_text,
+                "model_tier": selected_tier,
+                "model_reason": tier_reason,
                 "graph_state": state_snapshot,
                 "turn": current_turn,
             }

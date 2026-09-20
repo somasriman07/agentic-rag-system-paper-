@@ -153,6 +153,39 @@ Combining sparse (BM25) and dense (embedding) retrieval gave the system the best
 
 ---
 
+## Phase 8 — Frontier vs. Open-Weight Model Router (vLLM & GPU Serving)
+
+As the system matured, a critical production dilemma arose: **sending every query to a proprietary frontier cloud API is prohibitively expensive and introduces unnecessary latency, while relying solely on local models bottlenecks multi-paper synthesis and deep reasoning.**
+
+```
+                     User Query
+                         │
+                         ▼
+                Dual Model & Intent Router
+                /                  \
+               ↓                    ↓
+       Gemini 3.6 Flash            Qwen 2.5
+    (Proprietary Frontier API)   (Open-Weight on GPU)
+           │                        │
+  • Complex synthesis            • Specific paper lookup
+  • Deep cross-paper reasoning    • Factual extraction
+  • Theoretical derivations       • Single-concept Q&A
+  • High-ambiguity queries        • Routine summaries
+                                    │
+                              vLLM / Ollama
+                                    │
+                                   GPU
+```
+
+**The Solution:**
+1. **Intelligent Dual-Tier Routing**: Integrated a native structured classifier at the graph entrypoint that categorizes query complexity alongside retrieval intent.
+2. **Open-Weight GPU Serving via vLLM**: High-frequency, factual paper queries, specific parameter extractions, and single-paper questions are routed to **Qwen 2.5** running on GPU infrastructure served via **vLLM** (leveraging PagedAttention and continuous batching for maximum token throughput and zero cloud API cost).
+3. **Frontier Escalation to Gemini API**: Queries requiring multi-paper comparative synthesis, mathematical/theoretical reasoning, or scientific claim verification automatically escalate to **Gemini 3.6 Flash**.
+4. **Resilient Fallbacks**: If the open-weight GPU endpoint or local daemon experiences a connection drop, the graph automatically and gracefully falls back to the Gemini Frontier API with zero request drops.
+5. **Real-Time Telemetry**: Every assistant turn displays live UI badges with the model tier and the exact routing rationale.
+
+---
+
 ## 🔭 What's Next
 
 A few natural next steps that weren't fully captured above but are worth calling out as the project matures:

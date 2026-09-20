@@ -23,17 +23,38 @@ Read the full engineering story in [`PROJECT_FLOW.md`](./PROJECT_FLOW.md).
 
 | Feature | Description |
 |---|---|
-| 🧠 **Pluggable LLM Architecture** | Swap between local (Ollama) and cloud-hosted models via a factory pattern — zero changes to app logic |
+| 🧭 **Frontier vs. Open-Weight Router** | Dynamically routes queries between Gemini (Proprietary Frontier) and Qwen (Open-Weight on GPU via vLLM/Ollama) based on reasoning complexity |
+| 🧠 **Pluggable LLM Architecture** | Swap between local (Ollama/vLLM) and cloud-hosted models (Gemini/Groq/OpenAI) via a factory pattern — zero changes to app logic |
 | 📚 **Parent Document Retrieval** | Retrieves precise small chunks, answers with full parent context |
 | 🔍 **Hybrid Search** | BM25 (sparse/keyword) + dense embeddings, re-ranked with MMR for diverse, non-redundant results |
 | 🧵 **Stateless Chat Memory** | Per-session conversational context without cross-user state leakage |
 | 📈 **RAGAS-Evaluated** | Quantitatively benchmarked retrieval & generation quality, not just vibes |
 | ⚡ **LangGraph Orchestration** | The RAG pipeline is modeled as an explicit, inspectable graph rather than a black-box chain |
-| 🖥️ **Streamlit UI** | Lightweight, fast interface for asking questions and reviewing answers |
+| 🖥️ **Streamlit UI** | Lightweight, fast interface with live model routing telemetry and graph state inspection |
 
 ---
 
 ## 🏗️ Architecture
+
+```
+                             User Query
+                                 │
+                                 ▼
+                    Dual Model & Intent Router
+                    /                        \
+                   ↓                          ↓
+         Gemini 3.6 Flash                   Qwen
+     (Proprietary Frontier API)       (Open-Weight on GPU)
+               │                              │
+     • Complex synthesis              • Specific paper lookup
+     • Multi-paper reasoning          • Factual extraction
+     • Theoretical derivations        • Single-concept Q&A
+     • High-ambiguity queries         • Parameter / metric lookup
+                                              │
+                                        vLLM / Ollama
+                                              │
+                                             GPU
+```
 
 ```
                        .env
@@ -43,9 +64,11 @@ Read the full engineering story in [`PROJECT_FLOW.md`](./PROJECT_FLOW.md).
         │                           │
         ▼                           ▼
  llm_factory.py           embedding_factory.py
+   (Gemini + Qwen/vLLM)      (BGE / HuggingFace)
         │                           │
         ▼                           ▼
    rag_graph.py               vector_store.py
+ (Dual Model Router)             (Qdrant)
         │                           │
         ▼                           ▼
  btw_handler.py           CacheBackedEmbeddings
@@ -58,7 +81,7 @@ Read the full engineering story in [`PROJECT_FLOW.md`](./PROJECT_FLOW.md).
                    Streamlit
 ```
 
-**Design principle:** the `.env` config drives two independent factories — one for the LLM, one for embeddings — so the orchestration layer (`rag_graph.py`) and the UI never need to know or care whether inference is happening locally via Ollama or against a managed cloud API.
+**Design principle:** The system operates a dual-tier model hierarchy. Factual lookups and routine summaries are handled locally/on-GPU via Open-Weight **Qwen** (served via **vLLM** for continuous batching and high throughput), while multi-paper synthesis, theoretical trade-offs, and scientific claim verification are dynamically escalated to **Gemini 3.6 Flash** (Frontier API). The UI surfaces real-time routing decisions and rationales on every turn.
 
 ---
 
@@ -67,12 +90,14 @@ Read the full engineering story in [`PROJECT_FLOW.md`](./PROJECT_FLOW.md).
 | Layer | Tools |
 |---|---|
 | **Orchestration** | LangChain, LangGraph |
-| **LLM (dev)** | Ollama — `qwen2.5:3b` (lightweight, local, rate-limit-free) |
-| **Evaluation Judge** | Gemini (used only for RAGAS, since Ollama can't parallelize eval) |
-| **Embeddings** | HuggingFace (`CacheBackedEmbeddings`) |
+| **Frontier LLM** | Google Gemini 3.6 Flash (Proprietary Frontier API) |
+| **Open-Weight LLM** | Qwen 2.5 (`qwen2.5:3b` / `Qwen2.5-7B-Instruct`) |
+| **Inference & Serving** | vLLM (GPU continuous batching & PagedAttention) / Ollama |
+| **Evaluation Judge** | Gemini 3.6 Flash / Groq (decoupled RAGAS evaluation) |
+| **Embeddings** | HuggingFace `BAAI/bge-base-en-v1.5` (`CacheBackedEmbeddings`) |
 | **Vector Store** | Qdrant |
 | **Retrieval** | Parent Document Retrieval + Hybrid Search (BM25 + Dense + MMR) |
-| **Evaluation** | RAGAS (5-metric suite) |
+| **Evaluation** | RAGAS (5-metric suite: 0.93 Faithfulness, 0.95 Answer Relevancy) |
 | **Frontend** | Streamlit |
 | **Environment** | Python 3, `venv` |
 

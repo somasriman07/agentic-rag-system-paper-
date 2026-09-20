@@ -1,4 +1,4 @@
-# 🚀 Agentic RAG Chatbot
+ # 🚀 Agentic RAG Chatbot
 
 ### Intelligent Retrieval • Memory-Aware Conversations • Research Verification • Production-Oriented Architecture
 
@@ -109,23 +109,38 @@ This makes long-term conversation management significantly easier.
 
 ---
 
-# 🧭 Intelligent Router Node
+# 🧭 Intelligent Dual Router Node (Intent & Frontier Model Router)
 
-The chatbot first decides **where the answer should come from** before generating a response.
+The chatbot classifies queries along two dimensions: **where the answer should come from** and **which model tier should execute the reasoning**.
 
 ```
-                    User Query
-                         │
-                         ▼
-                 Intelligent Router
-                  /               \
-                 /                 \
-                ▼                   ▼
-      Knowledge Base          Web Search
-        (Qdrant)              (Internet)
+                             User Query
+                                 │
+                                 ▼
+                    Dual Model & Intent Router
+                    /                        \
+                   ↓                          ↓
+         Gemini 3.6 Flash                   Qwen
+     (Proprietary Frontier API)       (Open-Weight on GPU)
+               │                              │
+     • Complex synthesis              • Specific paper lookup
+     • Multi-paper reasoning          • Factual extraction
+     • Theoretical derivations        • Single-concept Q&A
+     • High-ambiguity queries         • Parameter / metric lookup
+                                              │
+                                        vLLM / Ollama
+                                              │
+                                             GPU
 ```
 
-The router dynamically selects the most appropriate retrieval strategy.
+### 1. Intent Routing
+* 📚 **Paper Retrieval (Qdrant)**: Detailed queries about ingested research papers.
+* 🌐 **Claim Verification (Web/arXiv)**: Checking if scientific claims are superseded by recent literature.
+* 💬 **Direct Answer**: Conversational greetings and general queries.
+
+### 2. Model Tier Routing
+* 💎 **Frontier API (Gemini 3.6 Flash)**: Activated for multi-paper comparative synthesis, mathematical proofs, cross-domain extrapolation, and nuanced claim verification.
+* ⚡ **Open-Weight GPU (Qwen 2.5 via vLLM / Ollama)**: Activated for specific section lookups, factual extractions, and single-paper queries, delivering sub-second latency with zero token costs.
 
 ---
 
