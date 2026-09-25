@@ -270,10 +270,19 @@ def get_llm(provider: str | None = None) -> BaseChatModel:
             raise ValueError(
                 "LLM_PROVIDER=gemini requires GEMINI_API_KEY (or GOOGLE_API_KEY) to be set."
             )
+        # thinking_budget=0 disables the "thinking" feature on Gemini 3.x models.
+        # When thinking is enabled, Gemini attaches a thought_signature to every
+        # tool call.  On subsequent agent turns the checkpointer replays the
+        # previous AIMessage (including its tool calls) back to the model, but the
+        # thought_signature is not preserved — Gemini then raises:
+        #   "Function call is missing a thought_signature in functionCall parts"
+        # Disabling thinking entirely avoids this at zero cost to answer quality
+        # for the retrieval and routing tasks this model performs.
         base_model = ChatGoogleGenerativeAI(
             model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
             google_api_key=api_key,
             temperature=0,
+            thinking={"thinking_budget": 0},
         )
         # Wrap with rate-limit retry proxy to survive free-tier 429 errors
         return _RateLimitedGemini(base_model)
