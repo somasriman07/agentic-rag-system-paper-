@@ -282,7 +282,7 @@ def get_llm(provider: str | None = None) -> BaseChatModel:
             model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
             google_api_key=api_key,
             temperature=0,
-            thinking={"thinking_budget": 0},
+            thinking_budget=0,
         )
         # Wrap with rate-limit retry proxy to survive free-tier 429 errors
         return _RateLimitedGemini(base_model)
