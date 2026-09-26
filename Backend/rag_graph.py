@@ -385,6 +385,42 @@ def router_node(state: RAGState) -> dict:
     }
 
 
+def _strip_thought_signatures(messages: list) -> list:
+    """Remove thought_signature from any AIMessage tool_calls in the history.
+
+    Gemini 3.x thinking models embed a thought_signature into every tool call
+    they emit.  When LangGraph replays the conversation history on subsequent
+    agent turns, those signatures are present in the serialised AIMessages but
+    the model (running with thinking_budget=0) no longer expects them — causing
+    a 400 InvalidArgument error.
+
+    This function deep-copies each message and strips the field so the history
+    is always clean before it is sent to the model.
+    """
+    import copy
+    cleaned = []
+    for msg in messages:
+        if not hasattr(msg, "tool_calls") or not msg.tool_calls:
+            cleaned.append(msg)
+            continue
+        msg_copy = copy.copy(msg)
+        clean_tool_calls = []
+        for tc in msg.tool_calls:
+            tc_copy = dict(tc) if isinstance(tc, dict) else tc.__dict__.copy()
+            tc_copy.pop("thought_signature", None)
+            # Also strip from nested 'function' dict if present
+            if isinstance(tc_copy.get("function"), dict):
+                tc_copy["function"].pop("thought_signature", None)
+            clean_tool_calls.append(tc_copy)
+        # Re-attach cleaned tool_calls — works for both dict and object forms
+        try:
+            msg_copy.tool_calls = clean_tool_calls
+        except AttributeError:
+            pass
+        cleaned.append(msg_copy)
+    return cleaned
+
+
 def agent_node(state: RAGState) -> dict:
     """Run one round of the retrieval agent.
 
@@ -397,7 +433,11 @@ def agent_node(state: RAGState) -> dict:
     if state.get("retrieval_attempts", 0) >= MAX_RETRIEVAL_ATTEMPTS:
         return {}
 
-    messages  = [{"role": "system", "content": RETRIEVE_SYSTEM_PROMPT}] + state["messages"]
+    # Strip thought_signatures from any replayed AIMessage tool calls —
+    # Gemini 3.x embeds these when thinking is on; replaying them with
+    # thinking_budget=0 causes a 400 InvalidArgument error.
+    clean_history = _strip_thought_signatures(state["messages"])
+    messages  = [{"role": "system", "content": RETRIEVE_SYSTEM_PROMPT}] + clean_history
     response  = retrieval_llm.invoke(messages)
     updates: dict = {"messages": [response]}
 
