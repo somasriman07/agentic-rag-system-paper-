@@ -88,9 +88,21 @@ except Exception as exc:
     openweight_llm = frontier_llm
 
 # Alias: `llm` is the model used for graph-internal operations
-# (router, relevancy check, query rewrite).  Always uses the frontier model
-# for consistency, regardless of the per-query model-tier decision.
-llm = frontier_llm
+# (router, relevancy check, query rewrite, verification).
+# Prefer Groq for these tasks — it's fast, free, and has no daily cap,
+# so internal pipeline steps don't burn the Gemini quota.
+# Fall back to frontier_llm only if Groq is not configured.
+def _get_internal_llm():
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if groq_key:
+        try:
+            from Backend.llm_factory import get_llm as _get_llm
+            return _get_llm(provider="groq")
+        except Exception as exc:
+            logger.warning("Groq unavailable for internal LLM (%s). Using Gemini.", exc)
+    return frontier_llm
+
+llm = _get_internal_llm()
 
 
 # ── Graph state ───────────────────────────────────────────────────────────────
@@ -328,25 +340,64 @@ relevancy_chain        = RELEVANCY_CHECK_PROMPT | llm
 def router_node(state: RAGState) -> dict:
     """Classify the query and select the model tier.
 
-    Calls the Frontier LLM with a structured output schema to produce a
-    DualRouterDecision containing:
-      - route       : where to send the query
-      - model_tier  : which LLM tier to use for the final answer
-      - reason      : human-readable rationale shown in the UI
+    Fast-path: obvious conversational queries (greetings, short questions with
+    no research keywords) are classified locally without calling the LLM at all,
+    saving a full Gemini round-trip and avoiding rate-limit pressure.
 
-    Falls back to a lightweight heuristic classifier if the LLM call fails.
-    Respects MODEL_ROUTING_MODE env var for manual override.
+    For everything else, calls the Frontier LLM with a structured output schema
+    to produce a DualRouterDecision.  Falls back to keyword heuristics if the
+    LLM call fails.  Respects MODEL_ROUTING_MODE env var for manual override.
     """
     query = state["messages"][-1].content
     mode  = os.getenv("MODEL_ROUTING_MODE", "dynamic").strip().lower()
 
-    # Sensible defaults used if both LLM call and heuristics fail
+    # ── Fast-path: detect conversational queries without an LLM call ──────────
+    # Greetings, name introductions, and very short general questions don't need
+    # retrieval or a frontier model — answer immediately with the open-weight tier.
+    _CONVERSATIONAL_PATTERNS = [
+        "hi", "hello", "hey", "good morning", "good evening", "good afternoon",
+        "how are you", "who are you", "what are you", "what can you do",
+        "my name is", "i am ", "i'm ", "nice to meet",
+        "thanks", "thank you", "bye", "goodbye",
+    ]
+    q_lower = query.lower().strip()
+    _RESEARCH_KEYWORDS = [
+        "paper", "research", "study", "model", "dataset", "method", "approach",
+        "algorithm", "accuracy", "benchmark", "result", "experiment", "figure",
+        "table", "section", "abstract", "conclusion", "architecture", "training",
+        "inference", "performance", "compare", "verify", "claim", "arxiv",
+    ]
+    is_conversational = (
+        len(query.split()) <= 12
+        and any(pat in q_lower for pat in _CONVERSATIONAL_PATTERNS)
+        and not any(kw in q_lower for kw in _RESEARCH_KEYWORDS)
+    )
+    if is_conversational and mode == "dynamic":
+        return {
+            "route":              "direct_answer",
+            "selected_model":     "qwen",
+            "model_route_reason": "Conversational query answered locally — no LLM router call needed.",
+        }
+
+    # ── Default values used if both LLM call and heuristics fail ──────────────
     route      = "retrieve"
     model_tier = "qwen"
     reason     = "Factual research retrieval routed to Open-Weight Qwen on GPU."
 
+    # Try Groq first for routing (fast, free, no daily cap).
+    # Fall back to Gemini only if Groq is unavailable.
+    # If both fail, use keyword heuristics — never block the user.
+    _router_llm = router_structured_llm  # Gemini by default
+    if os.getenv("GROQ_API_KEY", "").strip():
+        try:
+            from Backend.llm_factory import get_llm as _get_llm
+            _groq = _get_llm(provider="groq")
+            _router_llm = _groq.with_structured_output(DualRouterDecision)
+        except Exception:
+            pass  # Groq unavailable, stay with Gemini
+
     try:
-        decision: DualRouterDecision = router_structured_llm.invoke([
+        decision: DualRouterDecision = _router_llm.invoke([
             SystemMessage(content=ROUTER_SYSTEM_PROMPT),
             HumanMessage(content=query),
         ])
@@ -355,7 +406,8 @@ def router_node(state: RAGState) -> dict:
         reason     = decision.reason
 
     except Exception as exc:
-        # LLM call failed — apply keyword heuristics as a fallback
+        # LLM router failed (429, connection error, etc.) — apply keyword
+        # heuristics immediately so the user gets a response instead of an error.
         logger.warning("Router LLM failed (%s). Applying heuristic fallback.", exc)
         q = query.lower()
 
@@ -366,9 +418,16 @@ def router_node(state: RAGState) -> dict:
                                    "derive", "synthesize", "explain the difference"]):
             route, model_tier = "retrieve", "gemini"
             reason = "Complex multi-paper synthesis dispatched to Gemini Frontier."
-        elif len(query.split()) < 4 and any(g in q for g in ["hi", "hello", "hey", "who are you"]):
+        elif any(t in q for t in ["what is your", "tell me about yourself",
+                                   "how do you work", "what can you do",
+                                   "who made you", "architecture of this",
+                                   "how does this work"]):
             route, model_tier = "direct_answer", "qwen"
-            reason = "Conversational greeting handled by Open-Weight Qwen."
+            reason = "General question about the assistant answered directly."
+        else:
+            # Default: attempt retrieval with open-weight model
+            route, model_tier = "retrieve", "qwen"
+            reason = "Heuristic fallback: routed to retrieval with Open-Weight Qwen."
 
     # Manual override — env var wins over LLM routing decision
     if mode == "gemini":
@@ -658,6 +717,19 @@ def generate_answer_node(state: RAGState) -> dict:
 
     # ── Path 3: Direct answer (general knowledge) ─────────────────────────
     else:
+        # For direct answers (greetings, general knowledge) prefer Groq over
+        # Gemini — Groq is fast and free with no daily cap, so conversational
+        # queries never burn the Gemini quota or hit the rate-limit retry loop.
+        groq_key = os.getenv("GROQ_API_KEY", "").strip()
+        if groq_key:
+            try:
+                from Backend.llm_factory import get_llm as _get_llm
+                direct_llm = _get_llm(provider="groq")
+            except Exception:
+                direct_llm = active_llm
+        else:
+            direct_llm = active_llm
+
         messages = [
             SystemMessage(
                 content="You are a helpful research assistant. Answer the user's question "
@@ -665,11 +737,10 @@ def generate_answer_node(state: RAGState) -> dict:
             )
         ] + state["messages"]
         try:
-            answer = active_llm.invoke(messages).content
+            answer = direct_llm.invoke(messages).content
         except Exception as exc:
             logger.warning(
-                "Tier '%s' failed during generation (%s). Falling back to frontier.",
-                selected_tier, exc,
+                "Direct answer LLM failed (%s). Falling back to frontier.", exc
             )
             answer = frontier_llm.invoke(messages).content
 

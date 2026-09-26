@@ -37,9 +37,40 @@ from Backend.llm_factory import get_llm
 load_dotenv(override=True)
 
 
-# One shared LLM instance for the /btw handler (uses the configured provider,
-# which defaults to Gemini via LLM_PROVIDER in .env).
-_llm = get_llm()
+def _get_btw_llm():
+    """Return the LLM for /btw queries.
+
+    Prefers Groq (fast, free, no daily cap) so /btw never burns the Gemini
+    quota.  Falls back to the configured default provider if Groq is not set.
+    """
+    if os.getenv("GROQ_API_KEY", "").strip():
+        try:
+            return get_llm(provider="groq")
+        except Exception:
+            pass
+    return get_llm()
+
+
+# One shared LLM instance for the /btw handler
+_llm = _get_btw_llm()
+
+
+def _extract_text(chunk) -> str:
+    """Safely extract a plain string from an LLM streaming chunk.
+
+    Newer langchain-google-genai versions return content as a list of
+    content-block dicts (e.g. [{"type": "text", "text": "..."}]) instead of
+    a plain string.  This helper normalises both forms to a string.
+    """
+    content = chunk.content if hasattr(chunk, "content") else chunk
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            item.get("text", "") if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    return str(content) if content else ""
 
 
 def handle_btw(query: str) -> Generator[str, None, None]:
@@ -81,17 +112,26 @@ def handle_btw(query: str) -> Generator[str, None, None]:
         context = "\n\n".join(r["content"] for r in results["results"])
         sources = "\n".join(f"- {r['url']}" for r in results["results"])
 
-        answer_prompt = ChatPromptTemplate.from_messages([
-            (
-                "system",
+        # Use pre-built messages instead of ChatPromptTemplate — web results
+        # can contain curly braces (JSON, URLs with params) that LangChain's
+        # f-string template parser incorrectly treats as template variables.
+        from langchain_core.messages import SystemMessage as _SM, HumanMessage as _HM
+        messages = [
+            _SM(content=(
                 "Answer the question using the web search results below. "
                 "Be concise and cite your sources.\n\n"
-                f"Results:\n{context}\n\nSources:\n{sources}",
-            ),
-            ("human", "{query}"),
-        ])
+                f"Results:\n{context}\n\nSources:\n{sources}"
+            )),
+            _HM(content=query),
+        ]
+        for chunk in _llm.stream(messages):
+            text = _extract_text(chunk)
+            if text:
+                yield text
+        return  # done — skip Step 3
+
     else:
-        # Answer purely from model knowledge
+        # Answer purely from model knowledge — no dynamic content, safe to template
         answer_prompt = ChatPromptTemplate.from_messages([
             ("system", "Answer the question concisely from your general knowledge."),
             ("human", "{query}"),
@@ -99,5 +139,6 @@ def handle_btw(query: str) -> Generator[str, None, None]:
 
     # ── Step 3: Stream the response ────────────────────────────────────────
     for chunk in (answer_prompt | _llm).stream({"query": query}):
-        if chunk.content:
-            yield chunk.content
+        text = _extract_text(chunk)
+        if text:
+            yield text

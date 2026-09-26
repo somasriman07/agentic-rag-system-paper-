@@ -23,7 +23,20 @@ def get_graph():
 
 
 SESSIONS_FILE = Path("sessions.json")
-_rename_llm = get_llm()
+
+# Use Groq for session naming — it's a trivial 3-word task, no need to
+# burn a Gemini free-tier quota call on it. Falls back to default if Groq
+# is unavailable.
+def _get_rename_llm():
+    import os
+    if os.getenv("GROQ_API_KEY", "").strip():
+        try:
+            return get_llm(provider="groq")
+        except Exception:
+            pass
+    return get_llm()
+
+_rename_llm = _get_rename_llm()
 
 
 def load_sessions() -> dict:
@@ -41,6 +54,16 @@ def _serialize_state(values: dict) -> dict:
     out = {}
     for k, v in values.items():
         if k == "messages":
+            all_msgs = v or []
+            # Show only the current turn's messages — find the index of the
+            # last HumanMessage and slice from there.  This keeps the graph
+            # state inspector focused on what happened for this query only,
+            # rather than showing the full accumulated session history.
+            last_human_idx = None
+            for i, m in enumerate(all_msgs):
+                if type(m).__name__ == "HumanMessage":
+                    last_human_idx = i
+            turn_msgs = all_msgs[last_human_idx:] if last_human_idx is not None else all_msgs
             out[k] = [
                 {
                     "type": type(m).__name__,
@@ -50,7 +73,7 @@ def _serialize_state(values: dict) -> dict:
                         else repr(m.content)[:300]
                     ),
                 }
-                for m in (v or [])
+                for m in turn_msgs
             ]
         elif k == "retrieved_docs":
             out[k] = [
@@ -325,13 +348,16 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
     if is_btw:
         query = prompt.strip()[4:].strip()
 
-        with st.chat_message("user"):
-            st.markdown(prompt)
-            st.caption("Side channel — not saved to session history.")
-
-        with st.chat_message("assistant"):
+        # ── /btw: render in an ephemeral private block, never touch chats state ──
+        # The block is visually distinct from normal chat messages — uses an
+        # expander labelled "🔒 Private · not saved" so the user always knows
+        # this exchange is off-the-record.  Nothing is appended to
+        # st.session_state.chats so the conversation is gone on next rerun.
+        with st.expander("🔒 **Private /btw** · not saved to session history", expanded=True):
+            st.markdown(f"**You:** {prompt}")
+            st.divider()
             if not query:
-                st.markdown("Please add a question after `/btw`, e.g. `/btw What is attention?`")
+                st.warning("Add a question after `/btw` — e.g. `/btw What is attention?`")
             else:
                 placeholder = st.empty()
                 response_text = ""
@@ -339,7 +365,7 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
                     response_text += chunk
                     placeholder.markdown(response_text + "▌")
                 placeholder.markdown(response_text)
-            st.caption("Side channel — not saved to session history.")
+                st.caption("🔒 This response was not added to your session history.")
 
     else:
         if active_sid not in st.session_state.chats:

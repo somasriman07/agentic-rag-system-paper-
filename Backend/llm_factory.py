@@ -65,6 +65,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import ChatResult
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
+from langchain_core.runnables import RunnableSerializable
 
 load_dotenv(override=True)
 logger = logging.getLogger(__name__)
@@ -221,26 +222,34 @@ class _RateLimitedGemini(BaseChatModel):
         return f"_RateLimitedGemini({object.__getattribute__(self, '_model')!r})"
 
 
-class _RateLimitedRunnable:
+class _RateLimitedRunnable(RunnableSerializable):
     """Retry wrapper for arbitrary LangChain Runnables (e.g. structured-output chains).
 
-    Used internally by _RateLimitedGemini.with_structured_output() to ensure
-    the resulting runnable also benefits from 429 retry logic.
+    Subclasses RunnableSerializable so LangChain's pipe operator (prompt | runnable)
+    accepts it as a valid Runnable.  Used internally by
+    _RateLimitedGemini.with_structured_output() to ensure the resulting chain
+    also benefits from 429 retry logic.
     """
 
     def __init__(self, runnable) -> None:
-        self._runnable = runnable
+        # Store without triggering Pydantic field validation
+        object.__setattr__(self, "_runnable", runnable)
 
     def __getattr__(self, name: str):
-        return getattr(self._runnable, name)
+        return getattr(object.__getattribute__(self, "_runnable"), name)
+
+    # Required by RunnableSerializable
+    def get_input_schema(self, config=None):
+        r = object.__getattribute__(self, "_runnable")
+        return r.get_input_schema(config) if hasattr(r, "get_input_schema") else super().get_input_schema(config)
 
     @_retry_on_resource_exhausted
-    def invoke(self, *args, **kwargs):
-        return self._runnable.invoke(*args, **kwargs)
+    def invoke(self, input, config=None, **kwargs):
+        return object.__getattribute__(self, "_runnable").invoke(input, config, **kwargs)
 
     @_retry_on_resource_exhausted
-    def stream(self, *args, **kwargs):
-        return self._runnable.stream(*args, **kwargs)
+    def stream(self, input, config=None, **kwargs):
+        return object.__getattribute__(self, "_runnable").stream(input, config, **kwargs)
 
 
 # ── Provider factory ──────────────────────────────────────────────────────────
@@ -350,18 +359,69 @@ def get_openweight_llm() -> BaseChatModel:
     use.  If the local backend is unavailable *and* a GROQ_API_KEY is present,
     falls back to Groq-hosted inference so development is not blocked.
 
+    Note: Ollama fails at *invocation time* (connection refused), not at import.
+    The returned model is therefore wrapped so runtime connection errors also
+    trigger the Groq fallback seamlessly.
+
     Raises:
         Exception: Re-raises the original error if no fallback is available.
     """
     openweight_provider = os.getenv("OPENWEIGHT_PROVIDER", "ollama").lower()
     try:
-        return get_llm(provider=openweight_provider)
+        model = get_llm(provider=openweight_provider)
     except Exception as exc:
         logger.warning("Failed to initialise %s LLM: %s", openweight_provider, exc)
         if os.getenv("GROQ_API_KEY"):
             logger.info("Falling back to Groq hosted model.")
             return get_llm(provider="groq")
         raise
+
+    # If Groq is available, wrap the model so runtime connection errors
+    # (e.g. Ollama not running) automatically fall back to Groq.
+    if os.getenv("GROQ_API_KEY"):
+        groq_fallback = get_llm(provider="groq")
+
+        class _OllamaWithFallback:
+            """Thin proxy: tries Ollama, falls back to Groq on ConnectionError."""
+            def __getattr__(self, name):
+                return getattr(model, name)
+
+            def _call_with_fallback(self, method_name, *args, **kwargs):
+                try:
+                    return getattr(model, method_name)(*args, **kwargs)
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if "connection" in err or "refused" in err or "connect" in err:
+                        logger.warning(
+                            "Ollama connection failed (%s). Falling back to Groq.", exc
+                        )
+                        return getattr(groq_fallback, method_name)(*args, **kwargs)
+                    raise
+
+            def invoke(self, *args, **kwargs):
+                return self._call_with_fallback("invoke", *args, **kwargs)
+
+            def stream(self, *args, **kwargs):
+                return self._call_with_fallback("stream", *args, **kwargs)
+
+            def batch(self, *args, **kwargs):
+                return self._call_with_fallback("batch", *args, **kwargs)
+
+            def bind_tools(self, *args, **kwargs):
+                return model.bind_tools(*args, **kwargs)
+
+            def with_structured_output(self, *args, **kwargs):
+                return model.with_structured_output(*args, **kwargs)
+
+            def __or__(self, other):
+                return model.__or__(other)
+
+            def __ror__(self, other):
+                return model.__ror__(other)
+
+        return _OllamaWithFallback()
+
+    return model
 
 
 def get_llm_by_tier(tier: str = "gemini") -> BaseChatModel:
