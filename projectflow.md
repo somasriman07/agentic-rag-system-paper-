@@ -186,6 +186,55 @@ As the system matured, a critical production dilemma arose: **sending every quer
 
 ---
 
+---
+
+## Phase 9 — Three-Tier LLM Architecture & Quota Resilience
+
+As the system matured under real usage, a critical problem surfaced: **Gemini's free tier enforces a hard cap of 20 requests per day**. Because every internal pipeline step — routing, relevancy checking, query rewriting, session naming, and `/btw` — was calling Gemini, even a light testing session of 7–8 research queries exhausted the daily quota. The result was a silent 5-minute stall while the retry proxy waited for the rate-limit window to reset.
+
+**The diagnosis:** Gemini was being used for tasks that don't require frontier reasoning. A 3-word session title, a yes/no relevancy judgement, and a greeting response don't need a state-of-the-art reasoning model — they just need a fast, reliable text model.
+
+**The solution — three-tier model hierarchy:**
+
+```
+Tier 1  →  Fast-path pattern matcher   (zero LLM calls)
+           Greetings, name introductions, short conversational queries
+           Detected locally in router_node before any API call is made
+
+Tier 2  →  Groq                        (free, fast, unlimited)
+           All internal pipeline tasks:
+             • Intent + model-tier routing
+             • Retrieval agent (tool selection)
+             • Relevancy gate
+             • Query rewriting
+             • Claim verification
+             • /btw side-channel (routing + answer)
+             • Session auto-naming
+             • Direct answers (general knowledge)
+             • Ollama runtime fallback when qwen2.5:3b isn't running
+
+Tier 3  →  Gemini 3.6 Flash            (20 free calls/day, reserved)
+           Only the final answer generation for queries the router
+           explicitly classifies as needing frontier reasoning:
+             • Multi-paper comparative synthesis
+             • Theoretical derivations
+             • Cross-domain reasoning
+             • High-ambiguity research questions
+```
+
+**Additional hardening shipped in this phase:**
+
+- `_OllamaWithFallback` proxy — wraps the Qwen/Ollama model and catches runtime `ConnectionRefused` errors (Ollama not running), transparently rerouting to Groq without crashing
+- `_RateLimitedRunnable` now inherits from `RunnableSerializable` — fixes `TypeError` when using `|` pipe operator after `with_structured_output()` on the Groq model
+- `thought_signature` scrubbing in `agent_node` — strips Gemini thinking-mode signatures from replayed AIMessages so the `thinking_budget=0` fix is robust across session restarts
+- `/btw` rendered in an ephemeral `st.expander` block — visually distinct from normal chat, never appended to `st.session_state.chats`, collapses after the next interaction
+- Graph state inspector now shows **only the current turn's messages** — sliced from the last HumanMessage onward, not the full accumulated session history
+- `btw_handler` web-search path now builds messages directly instead of using `ChatPromptTemplate` — fixes `ValueError: Invalid format specifier` when Tavily results contain curly braces (JSON, URLs with query params)
+
+**Result:** A typical research session now uses 1 Gemini call (final answer) instead of 3–4, and a greeting or `/btw` query uses zero Gemini calls entirely.
+
+---
+
 ## 🔭 What's Next
 
 A few natural next steps that weren't fully captured above but are worth calling out as the project matures:

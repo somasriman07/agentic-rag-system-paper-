@@ -109,38 +109,58 @@ This makes long-term conversation management significantly easier.
 
 ---
 
-# 🧭 Intelligent Dual Router Node (Intent & Frontier Model Router)
+# 🧭 Three-Tier LLM Architecture (Intent Router + Model Tier)
 
-The chatbot classifies queries along two dimensions: **where the answer should come from** and **which model tier should execute the reasoning**.
+The system classifies queries along two dimensions simultaneously: **where the answer should come from** and **which model tier should execute the reasoning**. A third layer — the fast-path pattern matcher — handles obvious conversational queries before any LLM call is made at all.
 
 ```
                              User Query
                                  │
-                                 ▼
-                    Dual Model & Intent Router
-                    /                        \
-                   ↓                          ↓
-         Gemini 3.6 Flash                   Qwen
-     (Proprietary Frontier API)       (Open-Weight on GPU)
-               │                              │
-     • Complex synthesis              • Specific paper lookup
-     • Multi-paper reasoning          • Factual extraction
-     • Theoretical derivations        • Single-concept Q&A
-     • High-ambiguity queries         • Parameter / metric lookup
-                                              │
-                                        vLLM / Ollama
-                                              │
-                                             GPU
+                          Fast-path check
+                         (greeting / name?)
+                                 │
+                    ┌────────────┴─────────────┐
+                    │ Yes                       │ No
+                    ▼                           ▼
+             Direct answer              Groq Router LLM
+             (zero API call)          (classifies intent
+                                       + model tier)
+                                           │
+                              ┌────────────┴────────────┐
+                              │                         │
+                       model_tier=qwen          model_tier=gemini
+                              │                         │
+                    Qwen via Ollama/Groq       Gemini 3.6 Flash
+                    (factual lookups,          (multi-paper synthesis,
+                     single-paper Q&A,          theoretical derivations,
+                     definitions)               complex reasoning)
 ```
 
-### 1. Intent Routing
-* 📚 **Paper Retrieval (Qdrant)**: Detailed queries about ingested research papers.
-* 🌐 **Claim Verification (Web/arXiv)**: Checking if scientific claims are superseded by recent literature.
-* 💬 **Direct Answer**: Conversational greetings and general queries.
+**All internal pipeline steps** — routing, retrieval agent, relevancy gate, query rewriting, claim verification — run on **Groq** regardless of which model tier was selected for the final answer. This preserves Gemini's free-tier quota for queries that genuinely need frontier reasoning.
 
-### 2. Model Tier Routing
+### 1. Intent Routing (Groq)
+* 📚 **Paper Retrieval (Qdrant)**: Queries about ingested research papers.
+* 🌐 **Claim Verification (Web/arXiv)**: Checking if scientific claims are superseded by recent literature.
+* 💬 **Direct Answer**: Conversational greetings and general knowledge queries.
+
+### 2. Model Tier Routing (Groq decides, model executes)
 * 💎 **Frontier API (Gemini 3.6 Flash)**: Activated for multi-paper comparative synthesis, mathematical proofs, cross-domain extrapolation, and nuanced claim verification.
-* ⚡ **Open-Weight GPU (Qwen 2.5 via vLLM / Ollama)**: Activated for specific section lookups, factual extractions, and single-paper queries, delivering sub-second latency with zero token costs.
+* ⚡ **Open-Weight (Qwen 2.5 via Ollama / Groq fallback)**: Activated for specific section lookups, factual extractions, and single-paper queries.
+
+### 3. Which LLM runs what
+
+| Task | Model |
+|---|---|
+| Fast-path greeting detection | None (local pattern match) |
+| Intent + model-tier routing | Groq |
+| Retrieval agent (tool selection) | Groq |
+| Relevancy gate | Groq |
+| Query rewriting | Groq |
+| Claim verification | Groq |
+| /btw side-channel | Groq |
+| Session auto-naming | Groq |
+| Final answer — simple queries | Qwen / Groq fallback |
+| Final answer — complex queries | Gemini 3.6 Flash |
 
 ---
 

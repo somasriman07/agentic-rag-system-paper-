@@ -23,14 +23,16 @@ Read the full engineering story in [`projectflow.md`](./projectflow.md).
 
 | Feature | Description |
 |---|---|
-| 🧭 **Frontier vs. Open-Weight Router** | Dynamically routes queries between Gemini (Proprietary Frontier) and Qwen (Open-Weight on GPU via vLLM/Ollama) based on reasoning complexity |
+| 🧭 **Three-Tier LLM Architecture** | Groq handles all internal pipeline tasks (routing, relevancy, rewrite), Qwen/Ollama handles simple factual answers, Gemini 3.6 Flash is reserved exclusively for complex multi-paper synthesis |
+| 💰 **Quota-Aware Routing** | Conversational queries and pipeline internals never touch Gemini's free-tier cap — a fast-path pattern-matcher handles greetings locally; Groq handles everything else |
 | 🧠 **Pluggable LLM Architecture** | Swap between local (Ollama/vLLM) and cloud-hosted models (Gemini/Groq/OpenAI) via a factory pattern — zero changes to app logic |
 | 📚 **Parent Document Retrieval** | Retrieves precise small chunks, answers with full parent context |
 | 🔍 **Hybrid Search** | BM25 (sparse/keyword) + dense embeddings, re-ranked with MMR for diverse, non-redundant results |
+| 🔒 **Private /btw Side-Channel** | Off-record questions rendered in a distinct ephemeral block, never saved to session history or LangGraph checkpointer |
 | 🧵 **Stateless Chat Memory** | Per-session conversational context without cross-user state leakage |
 | 📈 **RAGAS-Evaluated** | Quantitatively benchmarked retrieval & generation quality, not just vibes |
 | ⚡ **LangGraph Orchestration** | The RAG pipeline is modeled as an explicit, inspectable graph rather than a black-box chain |
-| 🖥️ **Streamlit UI** | Lightweight, fast interface with live model routing telemetry and graph state inspection |
+| 🖥️ **Streamlit UI** | Lightweight, fast interface with live model routing telemetry and per-turn graph state inspection |
 
 ---
 
@@ -81,7 +83,7 @@ Read the full engineering story in [`projectflow.md`](./projectflow.md).
                    Streamlit
 ```
 
-**Design principle:** The system operates a dual-tier model hierarchy. Factual lookups and routine summaries are handled locally/on-GPU via Open-Weight **Qwen** (served via **vLLM** for continuous batching and high throughput), while multi-paper synthesis, theoretical trade-offs, and scientific claim verification are dynamically escalated to **Gemini 3.6 Flash** (Frontier API). The UI surfaces real-time routing decisions and rationales on every turn.
+**Design principle:** The system operates a **three-tier model hierarchy**. All pipeline-internal tasks — intent routing, retrieval agent, relevancy checking, query rewriting, and claim verification — run on **Groq** (fast, free, no daily cap). Simple factual paper lookups are handled by **Qwen** locally via Ollama (zero API cost). Multi-paper synthesis, theoretical reasoning, and complex cross-document analysis are escalated to **Gemini 3.6 Flash** (Frontier API) only when the query genuinely requires it. A fast-path pattern matcher intercepts obvious conversational queries before they reach any LLM at all. The UI surfaces real-time routing decisions and rationales on every turn.
 
 ---
 
@@ -90,14 +92,16 @@ Read the full engineering story in [`projectflow.md`](./projectflow.md).
 | Layer | Tools |
 |---|---|
 | **Orchestration** | LangChain, LangGraph |
-| **Frontier LLM** | Google Gemini 3.6 Flash (Proprietary Frontier API) |
-| **Open-Weight LLM** | Qwen 2.5 (`qwen2.5:3b` / `Qwen2.5-7B-Instruct`) |
+| **Frontier LLM** | Google Gemini 3.6 Flash — final answer for complex queries only |
+| **Pipeline LLM** | Groq — routing, relevancy check, query rewrite, claim verification, /btw, session naming |
+| **Open-Weight LLM** | Qwen 2.5 (`qwen2.5:3b` / `Qwen2.5-7B-Instruct`) via Ollama / vLLM |
+| **Groq Fallback** | Groq also serves as runtime fallback when Ollama is unavailable |
 | **Inference & Serving** | vLLM (GPU continuous batching & PagedAttention) / Ollama |
-| **Evaluation Judge** | Gemini 3.6 Flash / Groq (decoupled RAGAS evaluation) |
+| **Evaluation Judge** | Groq `openai/gpt-oss-120b` (decoupled RAGAS evaluation) |
 | **Embeddings** | HuggingFace `BAAI/bge-base-en-v1.5` (`CacheBackedEmbeddings`) |
 | **Vector Store** | Qdrant |
 | **Retrieval** | Parent Document Retrieval + Hybrid Search (BM25 + Dense + MMR) |
-| **Evaluation** | RAGAS (5-metric suite: 0.93 Faithfulness, 0.95 Answer Relevancy) |
+| **Evaluation** | RAGAS (4-metric suite: 0.93 Faithfulness, 0.95 Answer Relevancy) |
 | **Frontend** | Streamlit |
 | **Environment** | Python 3, `venv` |
 
@@ -155,6 +159,10 @@ TAVILY_API_KEY=your_tavily_api_key          # https://tavily.com
 QDRANT_URL=your_qdrant_cluster_url          # https://cloud.qdrant.io
 QDRANT_API_KEY=your_qdrant_api_key
 
+# ── Groq (strongly recommended — handles routing, relevancy, /btw) ─────────
+GROQ_API_KEY=your_groq_api_key              # https://console.groq.com (free tier)
+GROQ_MODEL=openai/gpt-oss-20b
+
 # ── Embeddings ────────────────────────────────────────────────────────────
 EMBEDDING_PROVIDER=huggingface              # huggingface | ollama | openai
 HF_EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
@@ -168,10 +176,9 @@ GEMINI_MODEL=gemini-3.6-flash
 OPENWEIGHT_PROVIDER=ollama                  # ollama | vllm
 OLLAMA_MODEL=qwen2.5:3b
 OLLAMA_BASE_URL=http://localhost:11434
-
-# ── Optional: Groq fallback for open-weight ───────────────────────────────
-# GROQ_API_KEY=your_groq_api_key
 ```
+
+> **Why Groq?** With `GROQ_API_KEY` set, all internal pipeline tasks (routing, relevancy check, query rewrite, session naming, `/btw`) run on Groq — fast and free. Gemini's 20 free requests/day are preserved exclusively for complex research synthesis queries that genuinely need frontier reasoning.
 
 ### 4. Pull the local LLM (for development)
 ```bash
