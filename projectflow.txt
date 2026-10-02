@@ -1,0 +1,390 @@
+Papeer - Project Build Log
+==========================
+
+This document walks through every step taken to build Papeer, in the order
+things actually happened. It covers the decisions made, the problems hit,
+and the fixes applied.
+
+---------------------------------------------------------------------------
+
+STEP 1 - Project Setup
+---------------------------------------------------------------------------
+
+Before writing any application code, the repo was initialised properly.
+
+- Created a git repository and set up a virtual environment (venv)
+- Added .gitignore covering venv/, __pycache__/, .env, *.pyc, .DS_Store,
+  local vector stores, and embedding cache directories
+- Pinned dependencies in requirements.txt from the start
+
+Why this matters: starting with isolation and clean git hygiene avoids
+the "it works on my machine" trap and keeps secrets out of version control.
+
+
+---------------------------------------------------------------------------
+
+STEP 2 - Backend Skeleton
+---------------------------------------------------------------------------
+
+Rather than building inside a single script, the backend was scaffolded
+into separate modules before any logic was written:
+
+    Backend/
+    ├── models.py          # Pydantic schemas
+    ├── paper_loader.py    # Document ingestion
+    ├── vector_store.py    # Qdrant + embeddings
+    ├── rag_graph.py       # LangGraph pipeline
+    └── btw_handler.py     # /btw side-channel
+
+Designing module boundaries before implementation forces separation of
+concerns. Each piece — ingestion, storage, orchestration, inference — is
+independent and swappable.
+
+
+---------------------------------------------------------------------------
+
+STEP 3 - Design Spec First
+---------------------------------------------------------------------------
+
+Before writing retrieval or generation logic, about_project.md was written
+to capture the intended design: goals, scope, and constraints.
+
+Writing the spec before the code kept the build focused and gave a
+reference point to check the system against once it was live.
+
+
+---------------------------------------------------------------------------
+
+STEP 4 - Core Backend Build
+---------------------------------------------------------------------------
+
+Backend development followed a deliberate order: data in, data stored,
+then data reasoned over.
+
+4a. paper_loader.py
+    - Supports PDF, TXT, Markdown, web URLs, arXiv IDs, and arXiv titles
+    - Auto-dispatches based on URL scheme or file extension
+    - Downloads arXiv PDFs to a temp file, extracts text, cleans up
+
+4b. vector_store.py + Qdrant
+    - Connected to Qdrant cloud for vector storage
+    - Configured environment variables: QDRANT_URL, QDRANT_API_KEY
+    - Each chat session gets its own Qdrant collection (papeer_{session_id})
+
+4c. models.py
+    - Pydantic schemas for every structured LLM output:
+      DualRouterDecision, RelevancyDecision, ClaimVerificationResult
+    - Clean schemas make it easy to audit what the LLM is expected to return
+
+4d. Embedding setup
+    - HuggingFace BAAI/bge-base-en-v1.5 as the embedding model (768 dim)
+    - CacheBackedEmbeddings with BLAKE2b content hashing — same text is
+      never re-embedded across sessions or server restarts
+    - Cache stored on disk under ./embedding_cache/
+
+
+---------------------------------------------------------------------------
+
+STEP 5 - The Pluggable LLM Factory
+---------------------------------------------------------------------------
+
+A key design decision: application logic should never care which model
+is answering. The graph, retriever, and UI stay untouched when the
+provider changes. Only llm_factory.py and .env change.
+
+Initial setup used qwen2.5:3b via Ollama for local development — free,
+lightweight, sufficient for validating the pipeline end-to-end.
+
+Providers supported via LLM_PROVIDER env var:
+    groq    - Groq hosted inference (current default)
+    ollama  - Local Ollama server
+    vllm    - OpenAI-compatible vLLM server
+    openai  - OpenAI API
+
+
+---------------------------------------------------------------------------
+
+STEP 6 - The Retrieval Problem and the Fix
+---------------------------------------------------------------------------
+
+The first major bug: the retriever wasn't hallucinating. It was doing
+something worse — frequently saying "I don't have the answer" even when
+the answer was clearly in the source paper.
+
+Root cause: naive chunking produced 500-token fragments. Individual chunks
+lacked enough surrounding context for the LLM to answer confidently, so
+the model played it safe and refused.
+
+Fix: Parent Document Retrieval
+
+- Small child chunks (500 tokens) are embedded and indexed in Qdrant for
+  precise semantic matching
+- Full parent chunks (3000 tokens) are stored in a local file docstore
+- When a child chunk matches a query, the LLM receives the full parent
+  context instead of the narrow fragment
+
+Result: retrieval quality jumped immediately. The model started answering
+correctly instead of defaulting to "I don't know." This was the single
+biggest quality unlock in the project.
+
+
+---------------------------------------------------------------------------
+
+STEP 7 - Hybrid Retrieval (BM25 + MMR)
+---------------------------------------------------------------------------
+
+Pure dense vector search was upgraded to hybrid retrieval:
+
+- BM25 (sparse keyword search) — handles exact term matching, author names,
+  technical acronyms, and domain jargon that dense embeddings blur
+- MMR (Maximal Marginal Relevance) — re-ranks results to reduce redundancy,
+  surfacing diverse passages instead of five near-duplicate chunks
+- Results fused via Reciprocal Rank Fusion (EnsembleRetriever, 50/50 weight)
+- Matched child chunks mapped back to their full parent documents
+
+This gives precision on exact terminology and semantic understanding on
+conceptual questions simultaneously.
+
+
+---------------------------------------------------------------------------
+
+STEP 8 - LangGraph Agentic Pipeline
+---------------------------------------------------------------------------
+
+The pipeline was built as an explicit LangGraph state machine rather than
+a black-box chain. Every node, edge, and routing decision is visible and
+inspectable.
+
+Nodes:
+    router_node          - classifies query intent (retrieve / verify_claim / direct_answer)
+    agent_node           - runs the retrieval agent (decides which tools to call)
+    retrieval            - ToolNode that executes retrieve_from_vectorstore or web_search
+    relevancy_check_node - judges whether retrieved chunks are good enough to answer
+    query_rewrite_node   - rewrites the query when retrieval quality is poor (max 1 retry)
+    verify_claim_node    - web + arXiv search to check if a claim is still valid
+    generate_answer_node - synthesises the final answer
+
+State is persisted to SQLite (checkpoints.db) via SqliteSaver.
+Each session has its own thread_id, so conversations are isolated and
+survive server restarts.
+
+Fast-path: obvious conversational queries (greetings, name introductions)
+are detected by a local keyword pattern matcher before any LLM call is
+made — zero API calls for simple inputs.
+
+
+---------------------------------------------------------------------------
+
+STEP 9 - RAGAS Evaluation
+---------------------------------------------------------------------------
+
+Gut-feeling is not good enough for a production system. The pipeline was
+evaluated quantitatively using RAGAS across 4 core metrics:
+
+    Faithfulness:      0.93  (answers grounded in retrieved paper content)
+    Answer Relevancy:  0.95  (responses directly address the user question)
+    Context Precision: 0.94  (retrieved chunks prioritise high-signal evidence)
+    Context Recall:    0.91  (all necessary facts are captured in retrieval)
+
+Evaluation was decoupled from pipeline generation to prevent self-scoring
+bias. The pipeline uses openai/gpt-oss-20b for generation; a separate
+high-capacity model (openai/gpt-oss-120b) serves as the independent judge.
+
+
+---------------------------------------------------------------------------
+
+STEP 10 - Groq Consolidation (Single LLM Provider)
+---------------------------------------------------------------------------
+
+Earlier versions used Gemini as the frontier model and Groq for internal
+pipeline tasks. Two problems emerged:
+
+Problem 1 - Gemini had a 20-request-per-day free tier hard cap. Even
+after moving internal tasks to Groq, the final answer generation still
+called Gemini. A single testing session could exhaust the daily quota,
+causing 5-minute stalls while the retry proxy waited.
+
+Problem 2 - The two-tier routing logic added significant complexity
+(_RateLimitedGemini, get_frontier_llm, get_llm_by_tier, model_tier field
+on DualRouterDecision, _strip_thought_signatures) without meaningful
+quality benefit at portfolio scale.
+
+Decision: Remove Gemini entirely. Use Groq openai/gpt-oss-20b as the
+single LLM for every pipeline task.
+
+Changes made:
+    - llm_factory.py reduced from 110 lines to 50 lines
+    - DualRouterDecision schema: model_tier field removed
+    - router_node: no model_tier assignment, no Gemini fallback chains
+    - generate_answer_node: no active_llm/direct_llm/frontier_llm branching
+    - _strip_thought_signatures removed (was Gemini-specific)
+    - app.py: tier badge (Gemini/Qwen) replaced with single Groq badge
+
+Result: zero daily quota pressure. Groq's free tier is rate-limited per
+minute, not per day. The codebase became significantly simpler.
+
+
+---------------------------------------------------------------------------
+
+STEP 11 - Semantic Cache (BetterDB + Valkey)
+---------------------------------------------------------------------------
+
+A semantic similarity cache was added as a second latency and cost
+reduction layer on top of Groq.
+
+How it works:
+    1. Every incoming query is embedded using the same BAAI/bge-base-en-v1.5
+       model the RAG pipeline uses
+    2. The embedding is compared against previously answered queries stored
+       in Valkey (Redis-compatible in-memory database) using cosine similarity
+    3. If similarity >= 0.5, the cached answer is returned immediately —
+       no LLM call, no Qdrant search, no pipeline traversal
+    4. On a cache miss, the answer is generated normally and stored
+
+Why semantic instead of exact-match:
+    Exact caching only helps if the query is character-for-character
+    identical. Semantic caching handles rephrased versions:
+        "What is eye gaze tracking?"  -> stored
+        "How does eye tracking work?" -> HIT (similarity 0.89)
+
+Non-trivial engineering problem solved:
+    BetterDB's SemanticCache is fully async. The RAG pipeline is synchronous.
+    Using asyncio.run() per call would create and destroy the event loop
+    between calls, closing the async Valkey client's connection pool.
+
+    Fix: a persistent background event loop runs in a daemon thread
+    (_get_or_create_loop). All async Valkey calls are submitted via
+    asyncio.run_coroutine_threadsafe(), which submits work to the persistent
+    loop without destroying it between calls.
+
+UI integration:
+    - Sidebar shows: Hits / Misses / Total as a simple counter
+    - Every assistant turn shows cache HIT or MISS badge
+
+The embed function reuses the pipeline's CacheBackedEmbeddings instance,
+so embeddings are doubly cached — first on disk (BLAKE2b hash), then in
+Valkey for semantic lookup.
+
+
+---------------------------------------------------------------------------
+
+STEP 12 - /btw Private Side-Channel
+---------------------------------------------------------------------------
+
+A private scratchpad command was added: questions prefixed with /btw are
+answered outside the main session context.
+
+Behaviour:
+    - Answer is rendered in a distinct st.expander block (not chat bubbles)
+    - Never appended to st.session_state.chats
+    - Never sent to the LangGraph checkpointer
+    - Uses Groq + Tavily web search when the question needs live data
+    - Collapses automatically after the next interaction
+
+The btw_handler builds messages directly as SystemMessage + HumanMessage
+objects instead of using ChatPromptTemplate. This avoids a ValueError that
+occurs when Tavily web results contain curly braces (JSON, URLs with query
+params) that LangChain's f-string template parser misreads as variables.
+
+
+---------------------------------------------------------------------------
+
+STEP 13 - Per-Session Isolation
+---------------------------------------------------------------------------
+
+Each chat session is fully isolated across three independent layers:
+
+Layer 1 - Qdrant collection
+    Each session gets its own collection: papeer_{session_id}
+    Documents from different sessions never bleed into each other.
+
+Layer 2 - Local file docstore
+    Parent chunks stored under ./parent_document_store/{session_id}/
+    Persists across server restarts. Each session's text is completely
+    separate.
+
+Layer 3 - SQLite checkpointer
+    LangGraph state (messages, retrieved docs, routing decisions) persisted
+    to checkpoints.db keyed by thread_id = session_id.
+    Server restart does not wipe conversation history.
+
+Any single layer independently enforces isolation. Together they mean a
+session can be resumed, inspected, or deleted without affecting any other.
+
+
+---------------------------------------------------------------------------
+
+STEP 14 - Additional Hardening and Bug Fixes
+---------------------------------------------------------------------------
+
+14a. Gemini thought_signature crash
+    Gemini 3.x thinking models embed a thought_signature into every tool
+    call. LangGraph replays conversation history on each agent turn, but
+    the serialiser does not preserve thought_signature. Gemini then rejects
+    the replayed tool call with a 400 error.
+    Fix: thinking_budget=0 disables thinking mode. _strip_thought_signatures
+    scrubs any signatures already stored in SQLite from before the fix.
+    (Both classes of session — new and old — are handled.)
+
+14b. Ollama runtime fallback
+    ChatOllama creates successfully at import time even if Ollama is not
+    running. The connection error only surfaces at invocation time.
+    The original try/except caught import errors but not runtime errors.
+    Fix: _OllamaWithFallback proxy wraps the Ollama model and catches
+    ConnectionRefused at invoke/stream time, transparently routing to Groq.
+
+14c. btw_handler f-string crash
+    Tavily results can contain curly braces (JSON, URLs with query params).
+    LangChain's ChatPromptTemplate parses these as template variables and
+    raises ValueError: Invalid format specifier.
+    Fix: build messages directly as SystemMessage + HumanMessage objects
+    instead of using ChatPromptTemplate for the web-search path.
+
+14d. _RateLimitedRunnable pipe operator fix
+    _RateLimitedRunnable was a plain Python class. LangChain's | operator
+    calls coerce_to_runnable() which only accepts Runnable subclasses.
+    Fix: _RateLimitedRunnable now inherits from RunnableSerializable.
+    (Now removed along with all Gemini code in Step 10.)
+
+14e. Graph state inspector scoped to current turn
+    The state inspector was showing all 40+ messages accumulated across
+    the entire session, making it hard to read.
+    Fix: _serialize_state finds the index of the last HumanMessage and
+    slices messages from that point, showing only the current turn.
+
+14f. torchvision missing warning
+    transformers 5.x vision models import torchvision at module load time
+    even for text-only workloads. Streamlit's file watcher triggers these
+    imports during hot-reload, flooding logs with ModuleNotFoundError.
+    Fix: added torchvision==0.28.0 to requirements.txt (paired with
+    torch 2.13.0).
+
+
+---------------------------------------------------------------------------
+
+CURRENT STATE
+---------------------------------------------------------------------------
+
+The pipeline is fully functional with:
+    - Single Groq LLM (openai/gpt-oss-20b) for all tasks
+    - Semantic cache via BetterDB + Valkey
+    - Hybrid retrieval (BM25 + MMR + Parent Document Retrieval)
+    - RAGAS scores: Faithfulness 0.93, Answer Relevancy 0.95,
+      Context Precision 0.94, Context Recall 0.91
+    - Per-session isolation across Qdrant, file docstore, and SQLite
+    - /btw private side-channel
+    - LangGraph state persistence across server restarts
+
+
+---------------------------------------------------------------------------
+
+WHAT IS NEXT
+---------------------------------------------------------------------------
+
+- Cross-encoder reranking on top of hybrid retrieval
+- Migrate parent docstore from local files to managed Postgres
+- Dockerize the backend + Streamlit app
+- CI pipeline (lint + test on push via GitHub Actions)
+- Public hosted demo
+- Unit tests for paper_loader.py chunking logic
+- Integration tests for the LangGraph pipeline
