@@ -10,9 +10,7 @@ extend or version the schemas without hunting through multiple files.
 
 Models defined here:
   - BtwRouteDecision      — /btw side-channel: does the query need a web search?
-  - DualRouterDecision    — main router: intent route + model tier selection
-  - RouterDecision        — (legacy) intent-only routing decision
-  - ModelTierDecision     — (legacy) model-tier-only decision
+  - DualRouterDecision    — main router: intent route selection
   - RelevancyDecision     — retrieval quality gate: are the chunks relevant?
   - SupersedingPaper      — a single paper that supersedes a claim
   - ClaimVerificationResult — full output of the claim-verification node
@@ -52,25 +50,25 @@ class DualRouterDecision(BaseModel):
 
     route: Literal["retrieve", "verify_claim", "direct_answer"] = Field(
         description=(
-            "'retrieve' for questions about uploaded papers, research methods, "
-            "benchmarks, or any document-grounded query; "
-            "'verify_claim' for checking whether a specific scientific claim has been "
-            "superseded by newer literature; "
-            "'direct_answer' for conversational greetings or pure general-knowledge questions."
+            "Choose exactly one of the three routes based on the user's intent:\n\n"
+            "'retrieve' — the user is asking about content from an uploaded research paper. "
+            "Use this for questions about methodologies, architectures, results, datasets, "
+            "algorithms, authors, figures, tables, or any specific information that would "
+            "require searching the document knowledge base. Also use this when the user "
+            "mentions a paper title, arXiv ID, or asks you to summarise an uploaded document.\n\n"
+            "'verify_claim' — the user wants to check whether a specific scientific claim, "
+            "finding, or result is still current or has been superseded by newer research. "
+            "Trigger words include: verify, is it still valid, has this been superseded, "
+            "is this outdated, what does recent research say about, check if this is true.\n\n"
+            "'direct_answer' — the user is making conversation, asking a general knowledge "
+            "question not related to any uploaded paper, or asking about the assistant itself. "
+            "Use this for greetings, introductions, thank-yous, and questions that can be "
+            "answered entirely from world knowledge without any document retrieval."
         )
     )
     reason: str = Field(
         description="One-sentence rationale explaining the route selection."
     )
-
-
-# ── Legacy single-dimension routing model ────────────────────────────────────
-
-class RouterDecision(BaseModel):
-    """Intent-only routing decision (legacy — prefer DualRouterDecision)."""
-
-    route: Literal["retrieve", "verify_claim", "direct_answer"]
-
 
 # ── Retrieval quality gate ────────────────────────────────────────────────────
 
