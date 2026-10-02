@@ -43,12 +43,11 @@ class BtwRouteDecision(BaseModel):
 # ── Main pipeline router ──────────────────────────────────────────────────────
 
 class DualRouterDecision(BaseModel):
-    """Combined intent + model-tier routing decision for the main RAG pipeline.
+    """Intent routing decision for the main RAG pipeline.
 
-    The router LLM fills this schema in a single call, choosing:
-      - *route*       — where to send the query (retrieval, claim verification, or direct)
-      - *model_tier*  — which LLM tier should generate the final answer
-      - *reason*      — a one-sentence human-readable rationale
+    The router LLM fills this schema, choosing:
+      - *route*  — where to send the query
+      - *reason* — a one-sentence human-readable rationale
     """
 
     route: Literal["retrieve", "verify_claim", "direct_answer"] = Field(
@@ -60,43 +59,17 @@ class DualRouterDecision(BaseModel):
             "'direct_answer' for conversational greetings or pure general-knowledge questions."
         )
     )
-    model_tier: Literal["gemini", "qwen"] = Field(
-        description=(
-            "'gemini' (Frontier API) for multi-paper comparative synthesis, theoretical "
-            "derivations, complex algorithmic trade-offs, or high-ambiguity questions; "
-            "'qwen' (Open-Weight GPU) for specific factual lookups, single-paper section "
-            "queries, parameter/metric extraction, definitions, or straightforward summaries."
-        )
-    )
     reason: str = Field(
-        description="One-sentence rationale explaining the model tier and route selection."
+        description="One-sentence rationale explaining the route selection."
     )
 
 
-# ── Legacy single-dimension routing models ───────────────────────────────────
-# Retained for compatibility with any evaluation or utility scripts that import
-# these directly.  New code should prefer DualRouterDecision.
+# ── Legacy single-dimension routing model ────────────────────────────────────
 
 class RouterDecision(BaseModel):
     """Intent-only routing decision (legacy — prefer DualRouterDecision)."""
 
     route: Literal["retrieve", "verify_claim", "direct_answer"]
-
-
-class ModelTierDecision(BaseModel):
-    """Model-tier-only routing decision (legacy — prefer DualRouterDecision)."""
-
-    model_tier: Literal["gemini", "qwen"] = Field(
-        description=(
-            "'gemini' for complex multi-paper synthesis, deep mathematical/theoretical "
-            "analysis, high ambiguity, or broad research reasoning; "
-            "'qwen' for direct paper lookup, factual extraction, specific questions, "
-            "or standard summaries."
-        )
-    )
-    reason: str = Field(
-        description="One-sentence explanation of why this model tier was selected."
-    )
 
 
 # ── Retrieval quality gate ────────────────────────────────────────────────────

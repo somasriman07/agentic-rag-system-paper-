@@ -2,7 +2,7 @@
 
 **Ask questions. Get grounded, cited answers straight from the research papers themselves — not the model's imagination.**
 
-Papeer is a production-minded Retrieval-Augmented Generation (RAG) system purpose-built for interacting with academic research papers. It's designed around a pluggable architecture that runs entirely on free/local tooling for development, while being production-ready to swap in managed cloud models with zero application-logic changes.
+Papeer is a production-minded Retrieval-Augmented Generation (RAG) system purpose-built for interacting with academic research papers. It's designed around a pluggable architecture that runs entirely on free tooling, while being production-ready to swap providers with a single env-var change.
 
 ---
 
@@ -23,39 +23,45 @@ Read the full engineering story in [`projectflow.md`](./projectflow.md).
 
 | Feature | Description |
 |---|---|
-| 🧭 **Three-Tier LLM Architecture** | Groq handles all internal pipeline tasks (routing, relevancy, rewrite), Qwen/Ollama handles simple factual answers, Gemini 3.6 Flash is reserved exclusively for complex multi-paper synthesis |
-| 💰 **Quota-Aware Routing** | Conversational queries and pipeline internals never touch Gemini's free-tier cap — a fast-path pattern-matcher handles greetings locally; Groq handles everything else |
-| 🧠 **Pluggable LLM Architecture** | Swap between local (Ollama/vLLM) and cloud-hosted models (Gemini/Groq/OpenAI) via a factory pattern — zero changes to app logic |
+| ⚡ **Single-Provider LLM** | Groq (`openai/gpt-oss-20b`) handles every pipeline task — routing, retrieval, relevancy, rewrite, generation — fast, free, no daily cap |
+| 🧠 **Semantic Cache** | BetterDB + Valkey vector similarity cache (threshold 0.5) — similar questions answered instantly from cache with hit/miss telemetry and cost-saved display |
 | 📚 **Parent Document Retrieval** | Retrieves precise small chunks, answers with full parent context |
 | 🔍 **Hybrid Search** | BM25 (sparse/keyword) + dense embeddings, re-ranked with MMR for diverse, non-redundant results |
 | 🔒 **Private /btw Side-Channel** | Off-record questions rendered in a distinct ephemeral block, never saved to session history or LangGraph checkpointer |
-| 🧵 **Stateless Chat Memory** | Per-session conversational context without cross-user state leakage |
+| 🧵 **Per-Session Isolation** | Each conversation gets its own Qdrant collection, local docstore, and SQLite checkpoint — state survives server restarts |
 | 📈 **RAGAS-Evaluated** | Quantitatively benchmarked retrieval & generation quality, not just vibes |
 | ⚡ **LangGraph Orchestration** | The RAG pipeline is modeled as an explicit, inspectable graph rather than a black-box chain |
-| 🖥️ **Streamlit UI** | Lightweight, fast interface with live model routing telemetry and per-turn graph state inspection |
+| 🖥️ **Streamlit UI** | Lightweight, fast interface with cache hit/miss badges and per-turn graph state inspection |
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-                             User Query
-                                 │
-                                 ▼
-                    Dual Model & Intent Router
-                    /                        \
-                   ↓                          ↓
-         Gemini 3.6 Flash                   Qwen
-     (Proprietary Frontier API)       (Open-Weight on GPU)
-               │                              │
-     • Complex synthesis              • Specific paper lookup
-     • Multi-paper reasoning          • Factual extraction
-     • Theoretical derivations        • Single-concept Q&A
-     • High-ambiguity queries         • Parameter / metric lookup
-                                              │
-                                        vLLM / Ollama
-                                              │
-                                             GPU
+                          User Query
+                               │
+                        Fast-path check
+                       (greeting/name?)
+                               │
+               ┌───────────────┴───────────────┐
+               │ Yes                           │ No
+               ▼                               ▼
+        Direct answer                   Groq Router LLM
+        (zero API call)              (intent classification)
+                                           │
+                          ┌────────────────┼────────────────┐
+                          ▼                ▼                 ▼
+                       retrieve      verify_claim     direct_answer
+                          │                │                 │
+                    Groq agent        Tavily web          Groq LLM
+                   (tool calls)      + arXiv search
+                          │
+                    Qdrant hybrid
+                    retrieval
+                    (BM25 + MMR)
+                          │
+                    Groq generates
+                    final answer
 ```
 
 ```
@@ -66,24 +72,26 @@ Read the full engineering story in [`projectflow.md`](./projectflow.md).
         │                           │
         ▼                           ▼
  llm_factory.py           embedding_factory.py
-   (Gemini + Qwen/vLLM)      (BGE / HuggingFace)
+   (Groq / Ollama / vLLM)    (BGE / HuggingFace)
         │                           │
         ▼                           ▼
    rag_graph.py               vector_store.py
- (Dual Model Router)             (Qdrant)
+  (Intent Router)                (Qdrant)
         │                           │
         ▼                           ▼
  btw_handler.py           CacheBackedEmbeddings
         │                           │
         └─────────────┬─────────────┘
                        ▼
+              semantic_cache.py
+              (BetterDB + Valkey)
+                       │
                    LangGraph
                        │
-                       ▼
                    Streamlit
 ```
 
-**Design principle:** The system operates a **three-tier model hierarchy**. All pipeline-internal tasks — intent routing, retrieval agent, relevancy checking, query rewriting, and claim verification — run on **Groq** (fast, free, no daily cap). Simple factual paper lookups are handled by **Qwen** locally via Ollama (zero API cost). Multi-paper synthesis, theoretical reasoning, and complex cross-document analysis are escalated to **Gemini 3.6 Flash** (Frontier API) only when the query genuinely requires it. A fast-path pattern matcher intercepts obvious conversational queries before they reach any LLM at all. The UI surfaces real-time routing decisions and rationales on every turn.
+**Design principle:** A single Groq model (`openai/gpt-oss-20b`) handles all pipeline tasks — routing, retrieval agent, relevancy checking, query rewriting, claim verification, and answer generation. A fast-path pattern matcher intercepts conversational queries before any API call is made. A semantic cache (BetterDB + Valkey) serves similar queries instantly from cache, reducing latency and API calls further.
 
 ---
 
@@ -92,11 +100,8 @@ Read the full engineering story in [`projectflow.md`](./projectflow.md).
 | Layer | Tools |
 |---|---|
 | **Orchestration** | LangChain, LangGraph |
-| **Frontier LLM** | Google Gemini 3.6 Flash — final answer for complex queries only |
-| **Pipeline LLM** | Groq — routing, relevancy check, query rewrite, claim verification, /btw, session naming |
-| **Open-Weight LLM** | Qwen 2.5 (`qwen2.5:3b` / `Qwen2.5-7B-Instruct`) via Ollama / vLLM |
-| **Groq Fallback** | Groq also serves as runtime fallback when Ollama is unavailable |
-| **Inference & Serving** | vLLM (GPU continuous batching & PagedAttention) / Ollama |
+| **LLM** | Groq `openai/gpt-oss-20b` — all pipeline tasks |
+| **Semantic Cache** | BetterDB + Valkey (vector similarity, threshold 0.5) |
 | **Evaluation Judge** | Groq `openai/gpt-oss-120b` (decoupled RAGAS evaluation) |
 | **Embeddings** | HuggingFace `BAAI/bge-base-en-v1.5` (`CacheBackedEmbeddings`) |
 | **Vector Store** | Qdrant |
@@ -113,20 +118,21 @@ Read the full engineering story in [`projectflow.md`](./projectflow.md).
 papeer/
 ├── Backend/
 │   ├── __init__.py
-│   ├── config.py          # Central config (embedding dim, etc.)
-│   ├── models.py          # Pydantic schemas for all LLM structured outputs
-│   ├── paper_loader.py    # Document ingestion (PDF, TXT, MD, URL, arXiv)
+│   ├── config.py            # Central config (embedding dim, etc.)
+│   ├── models.py            # Pydantic schemas for all LLM structured outputs
+│   ├── paper_loader.py      # Document ingestion (PDF, TXT, MD, URL, arXiv)
 │   ├── embedding_factory.py # Pluggable embedding model factory
-│   ├── llm_factory.py     # Pluggable LLM factory + Gemini 429 retry proxy
-│   ├── vector_store.py    # Qdrant vector store + hybrid retrieval
-│   ├── rag_graph.py       # LangGraph agentic pipeline orchestration
-│   └── btw_handler.py     # /btw private side-channel handler
-├── Documents/             # Sample research papers
-├── about_project.md       # Original design spec
-├── projectflow.md         # Full engineering build narrative
-├── graph.png              # Current LangGraph pipeline visualisation
+│   ├── llm_factory.py       # LLM factory (Groq / Ollama / vLLM / OpenAI)
+│   ├── vector_store.py      # Qdrant vector store + hybrid retrieval
+│   ├── rag_graph.py         # LangGraph agentic pipeline orchestration
+│   ├── btw_handler.py       # /btw private side-channel handler
+│   └── semantic_cache.py    # BetterDB + Valkey semantic cache layer
+├── Documents/               # Sample research papers
+├── about_project.md         # Original design spec
+├── projectflow.md           # Full engineering build narrative
+├── graph.png                # Current LangGraph pipeline visualisation
 ├── requirements.txt
-├── .env                   # API keys and config (never committed)
+├── .env                     # API keys and config (never committed)
 ├── .gitignore
 └── README.md
 ```
@@ -149,40 +155,37 @@ pip install -r requirements.txt
 ```
 > Using Windows/Linux? Activate with `venv\Scripts\activate` (Windows) or `source venv/bin/activate` (Linux).
 
-### 3. Configure environment variables
-Create a `.env` file in the root directory with the following keys:
+### 3. Start Valkey (for semantic cache)
+```bash
+# macOS with Homebrew
+brew install valkey && brew services start valkey
+
+# Or via Docker
+docker run -d -p 6379:6379 valkey/valkey
+```
+
+### 4. Configure environment variables
+Create a `.env` file in the root directory:
 ```env
 # ── Required ──────────────────────────────────────────────────────────────
-GEMINI_API_KEY=your_gemini_api_key          # Google AI Studio → https://aistudio.google.com
+GROQ_API_KEY=your_groq_api_key              # https://console.groq.com (free tier)
+GROQ_MODEL=openai/gpt-oss-20b
 TAVILY_API_KEY=your_tavily_api_key          # https://tavily.com
 
 QDRANT_URL=your_qdrant_cluster_url          # https://cloud.qdrant.io
 QDRANT_API_KEY=your_qdrant_api_key
 
-# ── Groq (strongly recommended — handles routing, relevancy, /btw) ─────────
-GROQ_API_KEY=your_groq_api_key              # https://console.groq.com (free tier)
-GROQ_MODEL=openai/gpt-oss-20b
+# ── LLM ───────────────────────────────────────────────────────────────────
+LLM_PROVIDER=groq
 
 # ── Embeddings ────────────────────────────────────────────────────────────
-EMBEDDING_PROVIDER=huggingface              # huggingface | ollama | openai
+EMBEDDING_PROVIDER=huggingface
 HF_EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
 
-# ── LLM routing ───────────────────────────────────────────────────────────
-LLM_PROVIDER=gemini                         # gemini | ollama | vllm | openai | groq
-MODEL_ROUTING_MODE=dynamic                  # dynamic | gemini | openweight
-GEMINI_MODEL=gemini-3.6-flash
-
-# ── Open-weight model (local / GPU) ───────────────────────────────────────
-OPENWEIGHT_PROVIDER=ollama                  # ollama | vllm
-OLLAMA_MODEL=qwen2.5:3b
-OLLAMA_BASE_URL=http://localhost:11434
-```
-
-> **Why Groq?** With `GROQ_API_KEY` set, all internal pipeline tasks (routing, relevancy check, query rewrite, session naming, `/btw`) run on Groq — fast and free. Gemini's 20 free requests/day are preserved exclusively for complex research synthesis queries that genuinely need frontier reasoning.
-
-### 4. Pull the local LLM (for development)
-```bash
-ollama pull qwen2.5:3b
+# ── Semantic cache ────────────────────────────────────────────────────────
+VALKEY_HOST=localhost
+VALKEY_PORT=6379
+SEMANTIC_CACHE_THRESHOLD=0.5
 ```
 
 ### 5. Run the app
@@ -193,17 +196,17 @@ streamlit run app.py
 ---
 
 ## 📊 Evaluation
- 
+
 The retrieval and generation pipeline is quantitatively benchmarked using **RAGAS** across 4 core evaluation metrics:
- 
+
 | Metric | Score | Description |
 |---|---|---|
 | **Faithfulness** | **0.93** (93%) | Answers are grounded strictly in retrieved paper context, eliminating hallucinations |
 | **Answer Relevancy** | **0.95** (95%) | Generated responses directly and completely answer user questions |
 | **Context Precision** | **0.94** (94%) | Retrieved parent chunks prioritize signal over noise, ranking relevant facts highest |
 | **Context Recall** | **0.91** (91%) | Pipeline retrieves all essential reference information required for the ground truth |
- 
-> **Decoupled Judge Architecture**: To prevent self-evaluation bias and avoid rate-limit bottlenecks, evaluation is decoupled from pipeline generation. While the pipeline operates on the generator model (`openai/gpt-oss-20b` / local Ollama), evaluation scoring is judged independently using a distinct high-capacity model (`openai/gpt-oss-120b`).
+
+> **Decoupled Judge Architecture**: Evaluation is decoupled from pipeline generation. The pipeline uses `openai/gpt-oss-20b` for generation; a separate high-capacity model (`openai/gpt-oss-120b`) serves as the independent RAGAS judge to prevent self-scoring bias.
 
 ---
 

@@ -153,85 +153,45 @@ Combining sparse (BM25) and dense (embedding) retrieval gave the system the best
 
 ---
 
-## Phase 8 — Frontier vs. Open-Weight Model Router (vLLM & GPU Serving)
+## Phase 8 — Groq-Only Architecture & Semantic Cache
 
-As the system matured, a critical production dilemma arose: **sending every query to a proprietary frontier cloud API is prohibitively expensive and introduces unnecessary latency, while relying solely on local models bottlenecks multi-paper synthesis and deep reasoning.**
+### The Groq Consolidation
 
-```
-                     User Query
-                         │
-                         ▼
-                Dual Model & Intent Router
-                /                  \
-               ↓                    ↓
-       Gemini 3.6 Flash            Qwen 2.5
-    (Proprietary Frontier API)   (Open-Weight on GPU)
-           │                        │
-  • Complex synthesis            • Specific paper lookup
-  • Deep cross-paper reasoning    • Factual extraction
-  • Theoretical derivations       • Single-concept Q&A
-  • High-ambiguity queries        • Routine summaries
-                                    │
-                              vLLM / Ollama
-                                    │
-                                   GPU
-```
+As the system matured under real usage, two problems emerged simultaneously:
 
-**The Solution:**
-1. **Intelligent Dual-Tier Routing**: Integrated a native structured classifier at the graph entrypoint that categorizes query complexity alongside retrieval intent.
-2. **Open-Weight GPU Serving via vLLM**: High-frequency, factual paper queries, specific parameter extractions, and single-paper questions are routed to **Qwen 2.5** running on GPU infrastructure served via **vLLM** (leveraging PagedAttention and continuous batching for maximum token throughput and zero cloud API cost).
-3. **Frontier Escalation to Gemini API**: Queries requiring multi-paper comparative synthesis, mathematical/theoretical reasoning, or scientific claim verification automatically escalate to **Gemini 3.6 Flash**.
-4. **Resilient Fallbacks**: If the open-weight GPU endpoint or local daemon experiences a connection drop, the graph automatically and gracefully falls back to the Gemini Frontier API with zero request drops.
-5. **Real-Time Telemetry**: Every assistant turn displays live UI badges with the model tier and the exact routing rationale.
+**Problem 1 — Gemini quota exhaustion.** Even after moving internal pipeline tasks to Groq, the final answer generation still called Gemini. With a 20-request-per-day free tier and multiple pipeline calls per query, the quota evaporated in a single testing session. The 5-minute stall from the retry proxy made the app feel broken.
+
+**Problem 2 — Complexity without payoff.** The two-tier routing logic (Gemini for complex, Qwen for simple) added significant code complexity — `_RateLimitedGemini`, `_RateLimitedRunnable`, `get_frontier_llm`, `get_llm_by_tier`, `_strip_thought_signatures`, `MODEL_ROUTING_MODE` — but the quality difference wasn't meaningful enough to justify the operational overhead for a portfolio-scale project.
+
+**The decision:** Remove Gemini entirely. Use **Groq `openai/gpt-oss-20b`** as the single LLM for every pipeline task. The result:
+
+- Zero daily quota pressure — Groq's free tier is generous and rate-limited per minute, not per day
+- 110-line `llm_factory.py` reduced to 50 lines
+- `router_node` simplified — no `model_tier` field, no Gemini fallback chains, no manual override env var
+- `generate_answer_node` simplified — no `active_llm`/`direct_llm`/`frontier_llm` branching
+- `_strip_thought_signatures` removed entirely (was Gemini-specific)
+
+### Semantic Cache — BetterDB + Valkey
+
+Beyond switching the LLM, a **semantic cache** was added as a second latency and cost reduction layer.
+
+**How it works:**
+- Every incoming query is embedded using the same `BAAI/bge-base-en-v1.5` model the RAG pipeline uses
+- The embedding is compared against previously answered queries stored in **Valkey** (Redis-compatible) using cosine similarity
+- If similarity ≥ 0.5, the cached answer is returned immediately — no LLM call, no Qdrant search, no pipeline traversal
+- On a cache miss, the answer is generated normally and stored so future similar queries benefit
+
+**What makes this non-trivial:**
+- BetterDB's `SemanticCache` is fully async; the RAG pipeline is synchronous. A persistent background event loop (`_get_or_create_loop()`) runs in a daemon thread — all async Valkey calls are submitted via `asyncio.run_coroutine_threadsafe()`. Using `asyncio.run()` per call would close the event loop between calls, invalidating the async Valkey client's connection pool.
+- The embed function reuses the pipeline's `CacheBackedEmbeddings` instance — embeddings are doubly cached (disk + Valkey)
+
+**UI integration:**
+- Sidebar shows a live **🧠 Semantic Cache** panel: Hit Rate %, Cost Saved $, Hits/Misses/Total
+- Every assistant turn shows `⚡ Cache HIT · similarity 0.xxx · saved $0.0000` or `🔄 Cache MISS`
 
 ---
 
----
-
-## Phase 9 — Three-Tier LLM Architecture & Quota Resilience
-
-As the system matured under real usage, a critical problem surfaced: **Gemini's free tier enforces a hard cap of 20 requests per day**. Because every internal pipeline step — routing, relevancy checking, query rewriting, session naming, and `/btw` — was calling Gemini, even a light testing session of 7–8 research queries exhausted the daily quota. The result was a silent 5-minute stall while the retry proxy waited for the rate-limit window to reset.
-
-**The diagnosis:** Gemini was being used for tasks that don't require frontier reasoning. A 3-word session title, a yes/no relevancy judgement, and a greeting response don't need a state-of-the-art reasoning model — they just need a fast, reliable text model.
-
-**The solution — three-tier model hierarchy:**
-
-```
-Tier 1  →  Fast-path pattern matcher   (zero LLM calls)
-           Greetings, name introductions, short conversational queries
-           Detected locally in router_node before any API call is made
-
-Tier 2  →  Groq                        (free, fast, unlimited)
-           All internal pipeline tasks:
-             • Intent + model-tier routing
-             • Retrieval agent (tool selection)
-             • Relevancy gate
-             • Query rewriting
-             • Claim verification
-             • /btw side-channel (routing + answer)
-             • Session auto-naming
-             • Direct answers (general knowledge)
-             • Ollama runtime fallback when qwen2.5:3b isn't running
-
-Tier 3  →  Gemini 3.6 Flash            (20 free calls/day, reserved)
-           Only the final answer generation for queries the router
-           explicitly classifies as needing frontier reasoning:
-             • Multi-paper comparative synthesis
-             • Theoretical derivations
-             • Cross-domain reasoning
-             • High-ambiguity research questions
-```
-
-**Additional hardening shipped in this phase:**
-
-- `_OllamaWithFallback` proxy — wraps the Qwen/Ollama model and catches runtime `ConnectionRefused` errors (Ollama not running), transparently rerouting to Groq without crashing
-- `_RateLimitedRunnable` now inherits from `RunnableSerializable` — fixes `TypeError` when using `|` pipe operator after `with_structured_output()` on the Groq model
-- `thought_signature` scrubbing in `agent_node` — strips Gemini thinking-mode signatures from replayed AIMessages so the `thinking_budget=0` fix is robust across session restarts
-- `/btw` rendered in an ephemeral `st.expander` block — visually distinct from normal chat, never appended to `st.session_state.chats`, collapses after the next interaction
-- Graph state inspector now shows **only the current turn's messages** — sliced from the last HumanMessage onward, not the full accumulated session history
-- `btw_handler` web-search path now builds messages directly instead of using `ChatPromptTemplate` — fixes `ValueError: Invalid format specifier` when Tavily results contain curly braces (JSON, URLs with query params)
-
-**Result:** A typical research session now uses 1 Gemini call (final answer) instead of 3–4, and a greeting or `/btw` query uses zero Gemini calls entirely.
+## 🔭 What's Next
 
 ---
 

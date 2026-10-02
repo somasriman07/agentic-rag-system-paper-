@@ -202,3 +202,4 @@ fastembed>=0.8.0
 # import torchvision at module load time even for text-only workloads.
 torch==2.13.0
 torchvision==0.28.0
+betterdb-semantic-cache

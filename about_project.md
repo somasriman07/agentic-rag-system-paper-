@@ -109,58 +109,55 @@ This makes long-term conversation management significantly easier.
 
 ---
 
-# 🧭 Three-Tier LLM Architecture (Intent Router + Model Tier)
+# 🧭 LLM Architecture — Groq Single-Provider
 
-The system classifies queries along two dimensions simultaneously: **where the answer should come from** and **which model tier should execute the reasoning**. A third layer — the fast-path pattern matcher — handles obvious conversational queries before any LLM call is made at all.
+The system uses a single LLM provider — **Groq `openai/gpt-oss-20b`** — for every pipeline task. A fast-path pattern matcher intercepts obvious conversational queries before any API call is made, and a semantic cache (BetterDB + Valkey) serves similar questions from memory without touching the LLM at all.
 
 ```
-                             User Query
-                                 │
-                          Fast-path check
-                         (greeting / name?)
-                                 │
-                    ┌────────────┴─────────────┐
-                    │ Yes                       │ No
-                    ▼                           ▼
-             Direct answer              Groq Router LLM
-             (zero API call)          (classifies intent
-                                       + model tier)
+                          User Query
+                               │
+                        Fast-path check
+                       (greeting/name?)
+                               │
+               ┌───────────────┴───────────────┐
+               │ Yes                           │ No
+               ▼                               ▼
+        Direct answer                   Groq Router LLM
+        (zero API call)              (intent classification)
                                            │
-                              ┌────────────┴────────────┐
-                              │                         │
-                       model_tier=qwen          model_tier=gemini
-                              │                         │
-                    Qwen via Ollama/Groq       Gemini 3.6 Flash
-                    (factual lookups,          (multi-paper synthesis,
-                     single-paper Q&A,          theoretical derivations,
-                     definitions)               complex reasoning)
+                          ┌────────────────┼────────────────┐
+                          ▼                ▼                 ▼
+                       retrieve      verify_claim     direct_answer
+                          │                │                 │
+                    Groq agent        Tavily web          Groq LLM
+                   (tool calls)      + arXiv search
+                          │
+                    Qdrant hybrid
+                    retrieval
+                          │
+                    Groq generates
+                    final answer
 ```
 
-**All internal pipeline steps** — routing, retrieval agent, relevancy gate, query rewriting, claim verification — run on **Groq** regardless of which model tier was selected for the final answer. This preserves Gemini's free-tier quota for queries that genuinely need frontier reasoning.
-
-### 1. Intent Routing (Groq)
+### Intent Routing (Groq)
 * 📚 **Paper Retrieval (Qdrant)**: Queries about ingested research papers.
 * 🌐 **Claim Verification (Web/arXiv)**: Checking if scientific claims are superseded by recent literature.
 * 💬 **Direct Answer**: Conversational greetings and general knowledge queries.
 
-### 2. Model Tier Routing (Groq decides, model executes)
-* 💎 **Frontier API (Gemini 3.6 Flash)**: Activated for multi-paper comparative synthesis, mathematical proofs, cross-domain extrapolation, and nuanced claim verification.
-* ⚡ **Open-Weight (Qwen 2.5 via Ollama / Groq fallback)**: Activated for specific section lookups, factual extractions, and single-paper queries.
-
-### 3. Which LLM runs what
+### Which LLM runs what
 
 | Task | Model |
 |---|---|
 | Fast-path greeting detection | None (local pattern match) |
-| Intent + model-tier routing | Groq |
+| Intent routing | Groq |
 | Retrieval agent (tool selection) | Groq |
 | Relevancy gate | Groq |
 | Query rewriting | Groq |
 | Claim verification | Groq |
 | /btw side-channel | Groq |
 | Session auto-naming | Groq |
-| Final answer — simple queries | Qwen / Groq fallback |
-| Final answer — complex queries | Gemini 3.6 Flash |
+| Final answer generation | Groq |
+| Semantic cache lookup | BetterDB + Valkey (no LLM call on HIT) |
 
 ---
 
@@ -283,6 +280,36 @@ Questions asked using this command:
   * Web Search (when required)
 
 Ideal for temporary questions that users don't want saved.
+
+---
+
+# ⚡ Semantic Cache — BetterDB + Valkey
+
+Instead of exact-match caching, the system uses **semantic similarity caching** to serve repeated or near-duplicate queries instantly.
+
+### How it works
+
+1. Every incoming query is embedded using the same `BAAI/bge-base-en-v1.5` model the RAG pipeline uses
+2. The embedding is compared against previously answered queries stored in **Valkey** (Redis-compatible vector store)
+3. If cosine similarity ≥ **0.5**, the cached answer is returned — no LLM call, no Qdrant search
+4. On a miss, the answer is generated normally and stored for future hits
+
+### UI Telemetry
+
+The sidebar shows a live **🧠 Semantic Cache** panel:
+- Hit Rate %
+- Cost Saved $
+- Hits / Misses / Total
+
+Every assistant response shows:
+- `⚡ Cache HIT · similarity 0.xxx · saved $0.0000`
+- `🔄 Cache MISS — answer generated and stored`
+
+### Why semantic, not exact?
+
+Exact caching only helps if the query is character-for-character identical. Semantic caching handles rephrased versions of the same question:
+- "What is eye gaze tracking?" → stored
+- "How does eye tracking work?" → **HIT** (similarity 0.89)
 
 ---
 
