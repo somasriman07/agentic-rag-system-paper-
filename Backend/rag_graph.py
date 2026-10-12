@@ -54,23 +54,25 @@ warnings.filterwarnings("ignore", message="The default value of `allowed_objects
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.prebuilt import InjectedState, ToolNode, tools_condition
 from langgraph.types import Command
-from pydantic import BaseModel, Field
 from tavily import TavilyClient
-import valkey.asyncio as valkey_async
-from betterdb_semantic_cache import SemanticCache, SemanticCacheOptions
-from betterdb_semantic_cache.embed.openai import create_openai_embed
-from betterdb_semantic_cache.types import CacheStoreOptions
 
 from Backend.llm_factory import get_llm, get_groq_llm
 from Backend.models import ClaimVerificationResult, DualRouterDecision
 from Backend.vector_store import search as vs_search
 from Backend.semantic_cache import cache_check, cache_store
+from Backend.guardrails import validate_input, validate_output, GuardrailBlocked
+from Backend.prompts import (
+    ROUTER_SYSTEM_PROMPT,
+    RETRIEVE_SYSTEM_PROMPT,
+    QUERY_REWRITE_SYSTEM_PROMPT,
+    CLAIM_ANALYSIS_PROMPT,
+    RELEVANCY_CHECK_PROMPT,
+)
+from Backend.tools import RETRIEVAL_TOOLS, retrieve_from_vectorstore, web_search
 
 load_dotenv(override=True)
 logger = logging.getLogger(__name__)
@@ -119,172 +121,17 @@ class RAGState(MessagesState):
     answer:              str | None
     is_relevant:         bool | None
     rewrite_count:       int
+    guardrail_blocked:   bool | None  # True when input guard rejected the query
     # ── Semantic cache fields ──────────────────────────────────────────────
     cache_hit:           bool | None
     cache_similarity:    float | None
     cache_cost_saved:    float | None
 
 
-# ── Prompt constants ──────────────────────────────────────────────────────────
-# All prompts live here so they can be reviewed, tuned, or unit-tested without
-# digging through node functions.
-
-# Router system prompt — guides the LLM to classify intent and model tier
-ROUTER_SYSTEM_PROMPT = (
-    "You are an intelligent router for a research paper RAG system.\n"
-    "Analyse the user's query and classify it into one of three routes:\n\n"
-    "   - 'retrieve': Questions about research papers, methods, architectures, "
-    "benchmark numbers, or any document-grounded query.\n"
-    "   - 'verify_claim': Checking if a specific scientific claim/result is "
-    "superseded or updated by newer literature.\n"
-    "   - 'direct_answer': Pure conversational greetings, general knowledge, "
-    "or basic non-paper questions.\n\n"
-    "Also provide a concise 1-sentence reason for your choice."
-)
-
-# Retrieval agent system prompt — instructs the agent on tool selection
-RETRIEVE_SYSTEM_PROMPT = (
-    "You are a research assistant gathering context to answer a user's question "
-    "about research papers.\n\n"
-    "You have two tools available:\n\n"
-    "1. retrieve_from_vectorstore — searches the uploaded paper collection.\n"
-    "   Choose the query carefully to match relevant paper chunks; set k to the "
-    "number of chunks needed (1–10).\n\n"
-    "2. web_search — searches the live web via Tavily.\n"
-    "   Rewrite the user's question as a concise, keyword-rich web query.\n\n"
-    "For questions about uploaded papers, always use retrieve_from_vectorstore.\n"
-    "Do NOT produce a final answer — only call tools to collect context."
-)
-
-# Query rewrite system prompt — asks for a better search query after failure
-QUERY_REWRITE_SYSTEM_PROMPT = (
-    "You are a query rewriting assistant for a research paper retrieval system. "
-    "The previous query failed to retrieve relevant document chunks. "
-    "Rewrite the query using more specific or alternative terminology, "
-    "domain-specific keywords, or a narrower sub-question.\n\n"
-    "Return ONLY the rewritten query as plain text. No explanation, no preamble."
-)
-
-# Claim analysis prompt — used inside verify_claim_node
-CLAIM_ANALYSIS_PROMPT = (
-    "You are a research fact-checker. Given a claim from a research paper and "
-    "a set of recent web and arXiv search results, determine:\n"
-    "1. Has this claim been superseded, significantly challenged, or updated by "
-    "more recent work?\n"
-    "2. Identify up to 3 papers from the provided results that supersede or update "
-    "the claim.\n\n"
-    "Rules:\n"
-    "- Use ONLY titles and URLs that appear verbatim in the provided search results.\n"
-    "- Prefer arXiv paper links (arxiv.org) over general web links when available.\n"
-    "- For each superseding paper, write one sentence explaining how it supersedes "
-    "the claim.\n"
-    "- If the claim still holds, set is_superseded=false and return an empty "
-    "superseding_papers list.\n"
-    "- verdict_summary should be 1-2 sentences suitable for display to the user."
-)
-
-# Relevancy check prompt template
-RELEVANCY_CHECK_PROMPT = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        "You evaluate whether retrieved document chunks contain relevant information "
-        "to answer the user's question about research papers.\n"
-        "Be lenient: if there is any substantive overlap or relevant context, "
-        "mark is_relevant as 'yes'.\n"
-        "Return ONLY a JSON object with keys 'is_relevant' (yes/no) and 'reason'."
-    ),
-    ("human", "Question: {query}\n\nRetrieved Chunks:\n{chunks}\n\nJSON decision:"),
-])
-
-
 # ── Pipeline constants ─────────────────────────────────────────────────────────
 
 # Maximum number of tool-call rounds the retrieval agent may perform per query
 MAX_RETRIEVAL_ATTEMPTS = 3
-
-
-# ── Tool input schemas ────────────────────────────────────────────────────────
-
-class RetrieverInput(BaseModel):
-    """Input schema for the vector-store retrieval tool."""
-    query: str  = Field(description="Semantic query to search research paper chunks.")
-    k:     int  = Field(default=4, ge=1, le=10, description="Number of chunks to retrieve.")
-
-
-class WebSearchInput(BaseModel):
-    """Input schema for the web search tool."""
-    optimized_query: str = Field(description="Query rewritten and optimised for web search.")
-    max_results:     int = Field(default=3, ge=1, le=10, description="Number of web results.")
-
-
-# ── Tools ─────────────────────────────────────────────────────────────────────
-
-@tool(args_schema=RetrieverInput)
-def retrieve_from_vectorstore(
-    query:        str,
-    k:            int,
-    session_id:   Annotated[str,  InjectedState("session_id")],
-    current_docs: Annotated[list, InjectedState("retrieved_docs")],
-    tool_call_id: Annotated[str,  InjectedToolCallId],
-) -> list:
-    """Search the uploaded research paper vector store for relevant passages.
-
-    Appends results to the accumulated retrieved_docs list in state so multiple
-    tool calls within the same agent turn build up context incrementally.
-    """
-    try:
-        docs = vs_search(query=query, session_id=session_id, k=k)
-    except Exception as exc:
-        logger.warning("Vector search failed (%s). Returning empty result.", exc)
-        docs = []
-
-    if not docs:
-        return [ToolMessage(
-            content="No relevant documents found in the vector store.",
-            tool_call_id=tool_call_id,
-        )]
-
-    return [
-        ToolMessage(
-            content=f"Retrieved {len(docs)} chunk(s) from the vector store.",
-            tool_call_id=tool_call_id,
-        ),
-        Command(update={"retrieved_docs": (current_docs or []) + docs}),
-    ]
-
-
-@tool(args_schema=WebSearchInput)
-def web_search(
-    optimized_query: str,
-    max_results:     int,
-    current_docs:    Annotated[list, InjectedState("retrieved_docs")],
-    tool_call_id:    Annotated[str,  InjectedToolCallId],
-) -> list:
-    """Search the live web using Tavily and append results as Documents.
-
-    Used when the query requires information not present in the uploaded papers,
-    or when the router determines a web search is needed.
-    """
-    client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
-    results = client.search(optimized_query, max_results=max_results)
-
-    if not results.get("results"):
-        return [ToolMessage(content="No web results found.", tool_call_id=tool_call_id)]
-
-    web_docs = [
-        Document(
-            page_content=r["content"],
-            metadata={"url": r["url"], "title": r.get("title", "Web Result")},
-        )
-        for r in results["results"]
-    ]
-    return [
-        ToolMessage(
-            content=f"Found {len(web_docs)} web result(s) for: {optimized_query}",
-            tool_call_id=tool_call_id,
-        ),
-        Command(update={"retrieved_docs": (current_docs or []) + web_docs}),
-    ]
 
 
 # ── Retrieval agent setup ─────────────────────────────────────────────────────
@@ -313,6 +160,10 @@ relevancy_chain        = RELEVANCY_CHECK_PROMPT | llm
 def router_node(state: RAGState) -> dict:
     """Classify the query and choose the intent route.
 
+    Input guards run first — jailbreak attempts and prompt injection are
+    blocked before any routing or LLM call is made. PII in the query is
+    anonymised before it is forwarded to external services (Tavily, arXiv).
+
     Fast-path: obvious conversational queries are classified locally with no
     LLM call at all, saving a Groq round-trip for simple greetings.
 
@@ -320,9 +171,48 @@ def router_node(state: RAGState) -> dict:
     a DualRouterDecision.  Falls back to keyword heuristics if the LLM call
     fails — the user always gets a response, never an error.
     """
-    query = state["messages"][-1].content
+    raw_query = state["messages"][-1].content
 
-    # ── Fast-path: detect conversational queries without an LLM call ──────────
+    # ── Input guardrails ───────────────────────────────────────────────────────
+    # validate_input raises on jailbreak / prompt injection.
+    # On PII detection it returns the anonymised query (on_fail="fix").
+    # If the guard is unavailable it returns the query unchanged.
+    try:
+        query = validate_input(raw_query)
+    except GuardrailBlocked as exc:
+        # Log which guard fired and why, then block the query
+        logger.warning(
+            "GUARDRAIL BLOCK | %s fired on session=%s | reason=%s",
+            exc.guard, state.get("session_id", "unknown"), exc.reason,
+        )
+        return {
+            "route":             "direct_answer",
+            "route_reason":      f"Query blocked by {exc.guard}.",
+            "guardrail_blocked": True,
+        }
+    except Exception as exc:
+        # Unexpected guardrail error — fail open, log and continue
+        logger.warning("GUARDRAIL ERROR | validate_input failed unexpectedly (%s) — continuing", exc)
+        query = raw_query
+
+    # ── Fast-path 1: PII-only input ───────────────────────────────────────────
+    # If validate_input stripped PII, the message is a personal info statement,
+    # not a research question. Route it as direct_answer immediately — don't
+    # let the query rewrite node turn it into a research retrieval query.
+    PII_PLACEHOLDER_RE = re.compile(
+        r"<(EMAIL_ADDRESS|PHONE_NUMBER|CREDIT_CARD|IBAN_CODE|IP_ADDRESS|"
+        r"US_SSN|US_BANK_NUMBER|US_DRIVER_LICENSE|US_ITIN|US_PASSPORT|"
+        r"UK_NHS|SG_NRIC_FIN|AU_ABN|AU_ACN|AU_TFN|AU_MEDICARE|"
+        r"IN_AADHAAR|IN_PAN|IN_VOTER|IN_PASSPORT)>"
+    )
+    if query != raw_query and PII_PLACEHOLDER_RE.search(query):
+        return {
+            "route":        "direct_answer",
+            "route_reason": "Personal information statement — answered directly without retrieval.",
+            "query":        query,
+        }
+
+    # ── Fast-path 2: detect conversational queries without an LLM call ────────
     _CONVERSATIONAL_PATTERNS = [
         "hi", "hello", "hey", "good morning", "good evening", "good afternoon",
         "how are you", "who are you", "what are you", "what can you do",
@@ -377,10 +267,26 @@ def router_node(state: RAGState) -> dict:
             route  = "retrieve"
             reason = "Heuristic fallback: routed to retrieval."
 
-    return {
+    # ── Write anonymised query and cleaned messages back to state ─────────────
+    # This ensures every downstream node (agent, relevancy, generate_answer)
+    # only ever sees the PII-free version of the user's message.
+    updates: dict = {
         "route":        route,
         "route_reason": reason,
+        "query":        query,   # anonymised by validate_input above
     }
+
+    # Replace the last HumanMessage in the message list with the cleaned text
+    # so the LLM never receives raw PII in its conversation context.
+    if query != raw_query:
+        msgs = list(state["messages"])
+        for i in range(len(msgs) - 1, -1, -1):
+            if type(msgs[i]).__name__ == "HumanMessage":
+                msgs[i] = HumanMessage(content=query)
+                break
+        updates["messages"] = msgs
+
+    return updates
 
 
 def agent_node(state: RAGState) -> dict:
@@ -540,6 +446,21 @@ def generate_answer_node(state: RAGState) -> dict:
     route = state.get("route")
     query = state["query"]
 
+    # ── Guardrail block short-circuit ──────────────────────────────────────────
+    # If the input guard blocked this query (jailbreak / prompt injection),
+    # return the refusal message immediately — no LLM call, no cache lookup.
+    if state.get("guardrail_blocked"):
+        refusal = "I'm sorry, I can't help with that request."
+        return {
+            "answer":            refusal,
+            # Intentionally NOT writing to messages — blocked queries must not
+            # be persisted to the checkpointer, otherwise the refusal text gets
+            # replayed as a HumanMessage in the next turn and corrupts history.
+            "cache_hit":         False,
+            "cache_similarity":  None,
+            "cache_cost_saved":  None,
+        }
+
     # ── Semantic cache check ───────────────────────────────────────────────
     _cache_eligible = route in ("retrieve", "direct_answer")
     if _cache_eligible:
@@ -630,6 +551,12 @@ def generate_answer_node(state: RAGState) -> dict:
         )
 
     clean_answer = re.sub(r"<think>[\s\S]*?</think>", "", str(answer)).strip()
+
+    # ── Output guardrail ───────────────────────────────────────────────────────
+    # Anonymise any PII that leaked from uploaded papers into the answer.
+    # on_fail="fix" means the guard replaces PII with placeholders and returns
+    # the cleaned text — it never blocks the response entirely.
+    clean_answer = validate_output(clean_answer)
 
     # ── Semantic cache store ───────────────────────────────────────────────
     if _cache_eligible:
